@@ -1,0 +1,34 @@
+# FUTURE-STAGE PLACEHOLDER
+# Training is not implemented in Stage 1. These values document the intended
+# small-GRU baseline and will become an executable contract in a later stage.
+status: planned
+implemented: false
+
+seed: 42
+device: auto  # Planned values: auto, cpu, or cuda.
+
+paths:
+  tokenized_dir: data/tokenized
+  checkpoints_dir: checkpoints
+  tensorboard_log_dir: outputs/logs
+  resume_from: null
+
+model:
+  architecture: gru
+  embedding_dim: 128
+  hidden_dim: 256
+  num_layers: 2
+  dropout: 0.2
+
+data:
+  sequence_length: 256
+  batch_size: 4
+  num_workers: 0
+
+training:
+  epochs: 50
+  learning_rate: 0.0003
+  gradient_clip: 1.0
+  mixed_precision: auto
+  checkpoint_every_epochs: 1
+

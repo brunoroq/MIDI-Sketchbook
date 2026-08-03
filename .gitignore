@@ -1,0 +1,66 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Virtual environments and local environment files
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# MIDI data: never commit personal, commercial, or third-party datasets
+*.mid
+*.midi
+
+# Derived datasets and manifests
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/tokenized/*
+!data/tokenized/.gitkeep
+data/splits/*
+!data/splits/.gitkeep
+
+# Model artifacts and large array/data files
+checkpoints/*
+!checkpoints/.gitkeep
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+
+# Generated results, plots, and logs
+outputs/generated/*
+!outputs/generated/.gitkeep
+outputs/plots/*
+!outputs/plots/.gitkeep
+outputs/logs/*
+!outputs/logs/.gitkeep
+runs/
+*.log
+events.out.tfevents.*

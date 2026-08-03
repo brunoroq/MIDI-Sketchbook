@@ -1,0 +1,45 @@
+# Stage 1 executable configuration.
+# Relative paths are resolved from the repository root, not from this file.
+random_seed: 42
+
+paths:
+  input_dir: data/raw
+  processed_dir: data/processed
+  manifest_path: data/splits/manifest.json
+
+validation:
+  pitch_min: 21
+  pitch_max: 108
+  allowed_time_signature: [4, 4]
+  # Many simple MIDI exports omit an explicit time-signature event. When this
+  # is true, a missing event is treated as the configured 4/4 signature.
+  allow_missing_time_signature: true
+  reject_pitch_bends: true  # Must remain true in Stage 1.
+  exclude_drums: true  # Must remain true in Stage 1.
+  min_notes_per_track: 1
+  tempo_tolerance: 0.01
+
+track_selection:
+  mode: most_notes  # Supported: most_notes or index.
+  # Zero-based index in pretty_midi.instruments, not a raw SMF track number.
+  track_index: null  # Required only when mode is index.
+
+preprocessing:
+  phrase_bars: 4  # Supported Stage 1 values: 2, 4, or 8.
+  remove_initial_silence: true
+  quantize: false
+  subdivisions_per_beat: 4
+  include_partial_final_phrase: true
+  min_notes_per_phrase: 1
+
+augmentation:
+  enabled: true
+  min_semitones: -5
+  max_semitones: 6
+  # Keep validation and test distributions untouched by default.
+  apply_to_splits: [train]
+
+splits:
+  train: 0.8
+  validation: 0.1
+  test: 0.1

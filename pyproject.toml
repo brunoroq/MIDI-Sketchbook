@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "midi-idea-generator"
+version = "0.1.0"
+description = "An experimental symbolic-music sketchbook built from user-supplied MIDI files."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { file = "LICENSE" }
+authors = [
+  { name = "MIDI-Sketchbook contributors" },
+]
+keywords = ["midi", "music-generation", "symbolic-music", "gru", "miditok"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Education",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Artistic Software",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "matplotlib>=3.11.1,<3.12",
+  "mido>=1.3.3,<1.4",
+  "miditok>=3.0.6.post1,<3.1",
+  "numpy>=1.26.4,<2.0",
+  "pretty-midi>=0.2.11,<0.3",
+  "PyYAML>=6.0.3,<7.0",
+  "symusic>=0.5.9,<0.6",
+  "tensorboard>=2.21.0,<2.22",
+  "torch>=2.12.1,<2.13",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.1.1,<10.0",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
