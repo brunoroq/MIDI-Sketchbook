@@ -14,7 +14,7 @@ finished songs, audio, tablature, or a legal guarantee of “original” music.
 > commercial MIDI files or protected third-party material to this repository.
 > Dataset MIDI files are ignored by Git and none are included here.
 
-## Current status: Stage 1
+## Current status: Stages 1 and 2
 
 Stage 1 is implemented: repository setup, MIDI inspection and basic
 preprocessing. The executable workflow can:
@@ -38,11 +38,25 @@ preprocessing. The executable workflow can:
   `data/processed/runs/<run_id>/{train,validation,test}/` and an authoritative
   JSON manifest at `data/splits/manifest.json`.
 
-REMI tokenization, the dataset/data loader, GRU training, checkpoints,
-TensorBoard logging, autoregressive sampling, seed-MIDI generation, and token
-decoding are **not implemented yet**. `configs/train.yaml` and
-`configs/generate.yaml` are clearly marked design placeholders for those later
-stages; changing them does not train or generate anything.
+Stage 2 REMI tokenization is also implemented. It:
+
+- consumes only the fragments named by the authoritative Stage 1 manifest,
+  never every file found under `data/processed`;
+- encodes each one-track phrase with MidiTok 3, adds explicit `BOS` and `EOS`
+  tokens, and reserves `PAD` for the future data loader without storing it in
+  unpadded sequences;
+- validates every sequence with an encode/decode/re-encode round trip while
+  retaining the MIDI instrument program as out-of-band metadata;
+- saves the complete tokenizer vocabulary and one JSON sequence per fragment,
+  preserving the Stage 1 train/validation/test assignment; and
+- publishes content-derived immutable runs under `data/tokenized/runs/` plus
+  the authoritative `data/tokenized/manifest.json`.
+
+The dataset/data loader, GRU training, checkpoints, TensorBoard logging,
+autoregressive sampling, seed-MIDI generation, and a generation/export command
+are **not implemented yet**. `configs/train.yaml` and `configs/generate.yaml`
+remain design placeholders for those later stages; changing them does not
+train or generate anything.
 
 ## Architecture and main decisions
 
@@ -53,14 +67,26 @@ YAML files hold experiment settings, errors are reported per file, random
 seeds make splits reproducible, and generated artifacts remain outside version
 control.
 
-The manifest is the dataset boundary: it records the normalized configuration,
-implementation and dependency versions, source SHA-256 hashes, split,
-instrument index, source duration/resolution, and every current fragment. A
-later tokenization stage must read its `fragments` entries and must not glob
-all of `data/processed`, because that directory can contain older immutable
-runs. Identical inputs and configuration reuse the same content-derived run
-ID; changed inputs or settings create an isolated run without deleting prior
-data.
+The Stage 1 manifest is the preprocessing/tokenization boundary: it records the
+normalized configuration, implementation and dependency versions, source
+SHA-256 hashes, split, instrument index, source duration/resolution, and every
+current fragment. Stage 2 reads exactly its `fragments` entries and does not
+glob `data/processed`, because that directory can contain older immutable runs.
+Both stages derive run IDs from their inputs and normalized configuration:
+identical work reuses the existing run, while changed inputs or settings create
+an isolated run without deleting prior data.
+
+The REMI settings in `configs/tokenize.yaml` were chosen from the current riff
+corpus rather than copied from a large generic dataset. The active grid uses 24
+positions per beat for durations from 0 to 4 beats, preserving binary
+subdivisions and triplets, then 4 positions per beat for durations up to 16
+beats to avoid unnecessary vocabulary growth. Tempo tokens use a configured
+40–250 BPM range, which covers the observed approximately 92–230 BPM. Velocity
+tokens are disabled because the inspected
+exports contain source-level velocity choices but no useful within-riff
+dynamics; preserving them would lengthen every note without adding meaningful
+variation. The guitar program is stored beside the token IDs instead of in the
+REMI vocabulary, consistent with the one-track Stage 1 boundary.
 
 The current preprocessing boundary deliberately assumes one principal
 instrumental track, 4/4 meter, constant tempo per fragment, no pitch bends,
@@ -81,14 +107,15 @@ with 4 GB of VRAM, but no memory or training claim can be tested until the
 training stage exists.
 
 ```text
-configs/                    executable preprocessing config + future templates
+configs/                    executable Stage 1/2 configs + future templates
 data/raw/                   user-supplied MIDI (ignored by Git)
 data/processed/runs/        immutable normalized runs, each grouped by split
-data/tokenized/             reserved for a later stage
-data/splits/                generated manifest
+data/tokenized/runs/        immutable REMI runs, each grouped by split
+data/tokenized/manifest.json authoritative current tokenization manifest
+data/splits/                authoritative Stage 1 preprocessing manifest
 outputs/                    generated results, plots, and logs (ignored)
 checkpoints/                future model checkpoints (ignored)
-scripts/                    Stage 1 command-line entry points
+scripts/                    Stage 1 and Stage 2 command-line entry points
 src/midi_idea_generator/    reusable package code
 tests/                      automated tests
 ```
@@ -104,21 +131,19 @@ declared conservative baseline targets PyTorch 2.12.1, MidiTok 3.0.6.post1,
 pretty_midi 0.2.11, and NumPy 1.26.4. Older PyTorch or MidiTok releases may not
 provide Python 3.12 support, while MidiTok major versions have incompatible
 APIs. In particular, MidiTok 3 consumes MIDI paths or `symusic.Score` objects
-and does not consume `pretty_midi.PrettyMIDI` objects. A later tokenization
-stage will keep a file boundary between pretty_midi preprocessing and MidiTok,
-and will not use legacy MidiTok 2.x examples.
+and does not consume `pretty_midi.PrettyMIDI` objects. Stage 2 therefore keeps
+a MIDI file boundary between preprocessing with pretty_midi and tokenization
+with MidiTok instead of relying on legacy MidiTok 2.x examples.
 
-This checkout was functionally exercised with the available Python 3.14.6
-interpreter, pretty_midi 0.2.11, Mido 1.3.3, PyYAML 6.0.3, and NumPy 2.5.1;
-the full test suite passes and all source files parse with Python 3.12 grammar.
-The host did not provide a Python 3.12 runtime, so the exact pinned 3.12/NumPy
-1.26 environment still needs a smoke run on the target machine. Python 3.12
-support and wheel availability were checked against official package metadata.
+The Stage 2 command and the current corpus were exercised with Python 3.12.13,
+MidiTok 3.0.6.post1, Symusic 0.5.9, pretty_midi 0.2.11, Mido 1.3.3, PyYAML
+6.0.3, and NumPy 1.26.4. The automated tests use synthetic MIDI fixtures in
+temporary directories; no dataset MIDI is committed.
 
 On Linux, the default PyPI PyTorch wheel may target a CUDA release unsupported
 by an older 4 GB GPU. Before installing the project, choose a CPU or CUDA wheel
 that matches the local driver and GPU using the [official PyTorch
-selector](https://pytorch.org/get-started/locally/). Stage 1 itself does not
+selector](https://pytorch.org/get-started/locally/). Stages 1 and 2 do not
 require a GPU.
 
 ## Installation
@@ -173,7 +198,12 @@ Each successful preprocessing manifest points to one immutable run. Old runs
 are intentionally left untouched for safety and can be removed manually only
 after confirming that their run ID is not referenced by the current manifest.
 
-## Tested Stage 1 commands
+Before tokenizing, review `configs/tokenize.yaml`. Stage 2 treats
+`data/splits/manifest.json` as authoritative and verifies every referenced
+fragment and hash. It does not discover additional MIDI files placed in an old
+processed run.
+
+## Tested Stage 1 and Stage 2 commands
 
 Inspect the raw collection:
 
@@ -194,18 +224,42 @@ Preprocess and build the leakage-safe splits and manifest:
 python scripts/preprocess.py --config configs/preprocess.yaml
 ```
 
+Tokenize the current Stage 1 manifest with REMI:
+
+```bash
+python scripts/tokenize_midis.py --config configs/tokenize.yaml
+```
+
+The command writes one immutable, split-preserving tokenization run:
+
+```text
+data/tokenized/runs/<run_id>/
+├── tokenizer.json
+├── manifest.json
+├── train/*.json
+├── validation/*.json
+└── test/*.json
+data/tokenized/manifest.json       authoritative current-run manifest
+```
+
+On the current corpus, the tested command encoded 294 sequences: 288 train, 2
+validation, and 4 test. The saved vocabulary has 364 tokens, and serialized
+sequence lengths—including `BOS` and `EOS`—range from 53 to 219 tokens. Stage 2
+does not truncate or pad these files; padding and batching belong to the future
+dataset/data-loader stage.
+
 Run the test suite:
 
 ```bash
 python -m pytest
 ```
 
-The current suite contains 73 synthetic tests and writes all MIDI fixtures to
+The suite contains 134 tests and writes all synthetic MIDI fixtures to
 temporary directories; no dataset MIDI is committed.
 
 There is intentionally no working `train.py` or `generate.py` command in
-Stage 1. Their planned configuration files are documentation, not executable
-features.
+Stages 1–2. Their planned configuration files are documentation, not
+executable features.
 
 ## Training and generation (future)
 
@@ -214,7 +268,8 @@ ignored, gradient clipping, optional stable mixed precision, checkpoints and
 TensorBoard loss metrics. Generation will support an empty start or seed MIDI,
 a reproducible random seed, maximum token count, temperature, top-k, top-p,
 sample count, and a simple repetition penalty. Empty or invalid decoded MIDI
-must not be saved. None of this behavior is available in Stage 1.
+must not be saved. None of this training or generation behavior is available
+in Stages 1–2.
 
 ## Limitations
 
@@ -234,14 +289,18 @@ must not be saved. None of this behavior is available in Stage 1.
 - Final phrase completeness is measured with the source End-of-Track duration,
   and generated phrase files preserve trailing rests up to their nominal
   2/4/8-bar boundary.
+- Stage 2 intentionally discards velocity variation, quantizes timing to its
+  configured REMI grid, and keeps the single guitar program outside the token
+  stream as sequence metadata.
 - Preprocessing cannot make an unsuitable or mislabeled dataset legally safe.
-- No model is trained and no MIDI is generated in Stage 1.
+- No model is trained and no MIDI is generated in Stages 1–2.
 
 ## Roadmap
 
 1. **Done:** structure, configuration, inspection, preprocessing, manifest,
    leakage-safe source splits, transposition, and critical Stage 1 tests.
-2. Add REMI tokenization with MidiTok and token round-trip tests.
+2. **Done:** data-driven REMI tokenization with MidiTok, explicit `PAD`/`BOS`/
+   `EOS`, token round-trip validation, immutable token runs, and Stage 2 tests.
 3. Add a sequence dataset and data loader with correct padding.
 4. Add the small GRU, CPU/CUDA training, gradient clipping, checkpoints,
    resuming, mixed precision where stable, and TensorBoard metrics.
@@ -277,7 +336,7 @@ garantizar “originalidad” musical en sentido legal.
 > MIDIs comerciales ni material protegido de terceros al repositorio. Git
 > ignora los archivos MIDI del dataset y este repositorio no incluye ninguno.
 
-## Estado actual: Etapa 1
+## Estado actual: Etapas 1 y 2
 
 La Etapa 1 está implementada: estructura del repositorio, inspección MIDI y
 preprocesamiento básico. El flujo ejecutable permite:
@@ -303,12 +362,26 @@ preprocesamiento básico. El flujo ejecutable permite:
   `data/processed/runs/<run_id>/{train,validation,test}/` y el manifiesto JSON
   autoritativo en `data/splits/manifest.json`.
 
-La tokenización REMI, el dataset/data loader, el entrenamiento GRU, los
-checkpoints, TensorBoard, el muestreo autorregresivo, la generación condicionada
-por un MIDI semilla y la decodificación a MIDI **todavía no están
-implementados**. `configs/train.yaml` y `configs/generate.yaml` son plantillas
-de diseño claramente marcadas para etapas futuras; modificarlas no entrena ni
-genera nada.
+La tokenización REMI de la Etapa 2 también está implementada. Esta etapa:
+
+- consume únicamente los fragmentos enumerados por el manifiesto autoritativo
+  de la Etapa 1, sin recorrer todos los archivos de `data/processed`;
+- codifica cada frase de una pista con MidiTok 3, agrega tokens `BOS` y `EOS`
+  explícitos y reserva `PAD` para el futuro data loader sin guardarlo dentro de
+  las secuencias aún no rellenadas;
+- valida cada secuencia mediante codificación/decodificación/recodificación y
+  conserva el programa del instrumento MIDI como metadata fuera del stream;
+- guarda el vocabulario completo y una secuencia JSON por fragmento sin cambiar
+  su asignación a entrenamiento, validación o prueba; y
+- publica corridas inmutables derivadas del contenido en
+  `data/tokenized/runs/`, junto al manifiesto autoritativo
+  `data/tokenized/manifest.json`.
+
+El dataset/data loader, el entrenamiento GRU, los checkpoints, TensorBoard, el
+muestreo autorregresivo, la generación condicionada por un MIDI semilla y un
+comando de generación/exportación **todavía no están implementados**.
+`configs/train.yaml` y `configs/generate.yaml` siguen siendo plantillas de
+diseño para esas etapas futuras; modificarlas no entrena ni genera nada.
 
 ## Arquitectura y decisiones principales
 
@@ -319,13 +392,28 @@ módulos separados y comprobables. YAML almacena los parámetros, los errores se
 reportan por archivo, las semillas hacen reproducibles los splits y los
 artefactos generados quedan fuera del control de versiones.
 
-El manifiesto define el dataset: registra configuración normalizada, versiones
-de implementación y dependencias, SHA-256 de cada fuente, split, índice de
-instrumento, duración/resolución y cada fragmento vigente. La tokenización
-posterior deberá leer `fragments` y nunca recorrer todo `data/processed`, que
-puede contener corridas inmutables antiguas. Entradas y configuración idénticas
-reutilizan el mismo run ID derivado del contenido; cualquier cambio crea una
-corrida aislada sin borrar datos previos.
+El manifiesto de la Etapa 1 define el límite entre preprocesamiento y
+tokenización: registra configuración normalizada, versiones de implementación
+y dependencias, SHA-256 de cada fuente, split, índice de instrumento,
+duración/resolución y cada fragmento vigente. La Etapa 2 lee exactamente sus
+entradas `fragments` y nunca recorre todo `data/processed`, que puede contener
+corridas inmutables antiguas. Ambas etapas derivan el run ID de sus entradas y
+configuración normalizada: un trabajo idéntico reutiliza la corrida existente;
+cualquier cambio crea una corrida aislada sin borrar datos previos.
+
+Los parámetros REMI de `configs/tokenize.yaml` se eligieron a partir del corpus
+actual de riffs, no copiando la configuración de un dataset genérico grande.
+La grilla activa usa 24 posiciones por pulso para duraciones entre 0 y 4 pulsos,
+lo que preserva subdivisiones binarias y tresillos, y 4 posiciones por pulso
+para duraciones de hasta 16 pulsos, evitando aumentar el vocabulario sin
+necesidad. Los tokens de tempo usan un rango configurado de 40–250 BPM, que
+cubre los aproximadamente 92–230 BPM observados. Los tokens de velocity están
+deshabilitados porque las exportaciones
+inspeccionadas tienen elecciones de velocity por fuente, pero no dinámicas
+útiles dentro del riff; conservarlos alargaría cada nota sin aportar variación
+relevante. El programa de guitarra se guarda junto a los IDs como metadata, no
+dentro del vocabulario REMI, de acuerdo con el límite de una sola pista de la
+Etapa 1.
 
 El límite actual asume una pista instrumental principal, compás 4/4, tempo
 constante por fragmento, ausencia de pitch bends y material monofónico o con
@@ -346,14 +434,15 @@ consumo y entrenamiento no podrán comprobarse hasta implementar esa etapa.
 ## Estructura del proyecto
 
 ```text
-configs/                    config ejecutable y plantillas futuras
+configs/                    configs ejecutables de Etapas 1/2 y plantillas
 data/raw/                   MIDI del usuario (ignorado por Git)
 data/processed/runs/        corridas inmutables, cada una separada por split
-data/tokenized/             reservado para una etapa posterior
-data/splits/                manifiesto generado
+data/tokenized/runs/        corridas REMI inmutables separadas por split
+data/tokenized/manifest.json manifiesto autoritativo de tokenización actual
+data/splits/                manifiesto autoritativo de preprocesamiento
 outputs/                    resultados, gráficos y logs (ignorados)
 checkpoints/                checkpoints futuros (ignorados)
-scripts/                    comandos de la Etapa 1
+scripts/                    comandos de las Etapas 1 y 2
 src/midi_idea_generator/    código reutilizable del paquete
 tests/                      tests automáticos
 ```
@@ -366,25 +455,23 @@ pretty_midi 0.2.11, Mido, NumPy, PyYAML, Matplotlib, TensorBoard y pytest.
 La compatibilidad entre Python, PyTorch y CUDA depende de los wheels y de la
 plataforma. El baseline conservador declarado usa PyTorch 2.12.1,
 MidiTok 3.0.6.post1, pretty_midi 0.2.11 y NumPy 1.26.4. Versiones antiguas
-pueden no soportar Python
-3.12 y las versiones mayores de MidiTok tienen APIs incompatibles. En
-particular, MidiTok 3 recibe rutas MIDI u objetos `symusic.Score`, no objetos
-`pretty_midi.PrettyMIDI`. La etapa posterior de tokenización mantendrá un límite
-por archivo entre el preprocesamiento con pretty_midi y MidiTok, sin copiar
-ejemplos antiguos de la API 2.x.
+pueden no soportar Python 3.12 y las versiones mayores de MidiTok tienen APIs
+incompatibles. En particular, MidiTok 3 recibe rutas MIDI u objetos
+`symusic.Score`, no objetos `pretty_midi.PrettyMIDI`. Por eso la Etapa 2
+mantiene un límite por archivo MIDI entre el preprocesamiento con pretty_midi y
+la tokenización con MidiTok, en vez de depender de ejemplos antiguos de la API
+2.x.
 
-Este checkout se ejercitó funcionalmente con el intérprete disponible Python
-3.14.6, pretty_midi 0.2.11, Mido 1.3.3, PyYAML 6.0.3 y NumPy 2.5.1; la suite
-completa pasa y todo el código se analiza con la gramática de Python 3.12. El
-host no dispone de un runtime 3.12, por lo que aún corresponde ejecutar un
-smoke test del entorno exacto Python 3.12/NumPy 1.26 en la máquina objetivo. El
-soporte y los wheels para 3.12 sí se comprobaron contra metadata oficial.
+El comando de la Etapa 2 y el corpus actual se ejercitaron con Python 3.12.13,
+MidiTok 3.0.6.post1, Symusic 0.5.9, pretty_midi 0.2.11, Mido 1.3.3, PyYAML
+6.0.3 y NumPy 1.26.4. Los tests automáticos usan fixtures MIDI sintéticos en
+directorios temporales; no se versiona ningún MIDI del dataset.
 
 En Linux, el wheel PyTorch predeterminado de PyPI puede apuntar a una versión
 CUDA incompatible con una GPU antigua de 4 GB. Antes de instalar el proyecto,
 elige un wheel CPU o CUDA que corresponda al driver y GPU local mediante el
-[selector oficial de PyTorch](https://pytorch.org/get-started/locally/). La
-Etapa 1 no necesita GPU.
+[selector oficial de PyTorch](https://pytorch.org/get-started/locally/). Las
+Etapas 1 y 2 no necesitan GPU.
 
 ## Instalación
 
@@ -440,7 +527,12 @@ Cada manifiesto exitoso apunta a una sola corrida inmutable. Las corridas
 anteriores se conservan por seguridad y solo deben borrarse manualmente después
 de comprobar que su run ID no está referenciado por el manifiesto actual.
 
-## Comandos probados de la Etapa 1
+Antes de tokenizar, revisa `configs/tokenize.yaml`. La Etapa 2 considera
+autoritativo `data/splits/manifest.json` y verifica cada fragmento referenciado
+y su hash. No descubre MIDIs adicionales colocados dentro de una corrida
+procesada antigua.
+
+## Comandos probados de las Etapas 1 y 2
 
 Inspecciona la colección:
 
@@ -461,17 +553,41 @@ Preprocesa, crea splits seguros y escribe el manifiesto:
 python scripts/preprocess.py --config configs/preprocess.yaml
 ```
 
+Tokeniza con REMI el manifiesto vigente de la Etapa 1:
+
+```bash
+python scripts/tokenize_midis.py --config configs/tokenize.yaml
+```
+
+El comando escribe una corrida inmutable que conserva los splits:
+
+```text
+data/tokenized/runs/<run_id>/
+├── tokenizer.json
+├── manifest.json
+├── train/*.json
+├── validation/*.json
+└── test/*.json
+data/tokenized/manifest.json       manifiesto autoritativo de la corrida actual
+```
+
+Sobre el corpus actual, el comando probado codificó 294 secuencias: 288 de
+entrenamiento, 2 de validación y 4 de prueba. El vocabulario guardado tiene 364
+tokens y las longitudes serializadas —incluidos `BOS` y `EOS`— van de 53 a 219
+tokens. La Etapa 2 no trunca ni rellena estos archivos; el padding y los batches
+pertenecen a la futura etapa de dataset/data loader.
+
 Ejecuta los tests:
 
 ```bash
 python -m pytest
 ```
 
-La suite actual contiene 73 tests sintéticos y escribe todos los fixtures MIDI
-en directorios temporales; no se versiona ningún MIDI de dataset.
+La suite contiene 134 tests y escribe todos los fixtures MIDI sintéticos en
+directorios temporales; no se versiona ningún MIDI del dataset.
 
-En la Etapa 1 no existe un comando funcional `train.py` ni `generate.py`. Sus
-archivos de configuración documentan el roadmap, no funciones ejecutables.
+En las Etapas 1–2 no existe un comando funcional `train.py` ni `generate.py`.
+Sus archivos de configuración documentan el roadmap, no funciones ejecutables.
 
 ## Entrenamiento y generación (futuro)
 
@@ -481,7 +597,7 @@ estable, checkpoints y métricas de loss en TensorBoard. La generación admitir�
 inicio vacío o MIDI semilla, semilla aleatoria reproducible, máximo de tokens,
 temperature, top-k, top-p, número de muestras y una penalización sencilla de
 repetición. No deberán guardarse MIDIs vacíos o inválidos. Ninguna de estas
-funciones está disponible en la Etapa 1.
+funciones de entrenamiento o generación está disponible en las Etapas 1–2.
 
 ## Limitaciones actuales
 
@@ -501,16 +617,21 @@ funciones está disponible en la Etapa 1.
 - La completitud de la última frase usa la duración End-of-Track de la fuente y
   los fragmentos preservan silencios finales hasta el límite nominal de 2/4/8
   compases.
+- La Etapa 2 descarta intencionalmente las variaciones de velocity, cuantiza el
+  timing a la grilla REMI configurada y conserva el único programa de guitarra
+  fuera del stream, como metadata de la secuencia.
 - El preprocesamiento no vuelve legalmente seguro un dataset inadecuado o mal
   etiquetado.
-- En la Etapa 1 no se entrena un modelo ni se genera MIDI.
+- En las Etapas 1–2 no se entrena un modelo ni se genera MIDI.
 
 ## Roadmap
 
 1. **Hecho:** estructura, configuración, inspección, preprocesamiento,
    manifiesto, splits por fuente sin leakage, transposición y tests críticos de
    la Etapa 1.
-2. Agregar tokenización REMI con MidiTok y tests de ida y vuelta de tokens.
+2. **Hecho:** tokenización REMI basada en los datos con MidiTok, `PAD`/`BOS`/
+   `EOS` explícitos, validación de ida y vuelta, corridas inmutables de tokens y
+   tests de la Etapa 2.
 3. Agregar dataset secuencial y data loader con padding correcto.
 4. Agregar GRU pequeña, entrenamiento CPU/CUDA, gradient clipping,
    checkpoints, reanudación, precisión mixta cuando sea estable y métricas en

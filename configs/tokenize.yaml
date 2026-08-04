@@ -1,0 +1,41 @@
+# Stage 2 executable configuration.
+# Relative paths are resolved from the repository root, not from this file.
+paths:
+  # Stage 2 consumes only entries listed by Stage 1 in this manifest. It must
+  # not discover processed files by globbing data/processed.
+  preprocessing_manifest_path: data/splits/manifest.json
+  tokenized_dir: data/tokenized
+  manifest_path: data/tokenized/manifest.json
+
+tokenizer:
+  type: remi
+  # Both bounds are inclusive in the pinned MidiTok 3.0.6.post1 release.
+  pitch_min: 21
+  pitch_max: 108
+  # Twenty-four positions per beat preserve the original riff timing almost
+  # exactly, including binary subdivisions and triplets. Longer durations use
+  # a smaller vocabulary beyond four beats.
+  beat_res:
+    - start_beat: 0
+      end_beat: 4
+      resolution: 24
+    - start_beat: 4
+      end_beat: 16
+      resolution: 4
+  special_tokens: [PAD, BOS, EOS]
+  encode_ids_split: bar
+
+  # The inspected exports contain source-level velocity choices but no useful
+  # within-riff dynamics, so velocity tokens would only lengthen each sequence.
+  use_velocities: false
+  num_velocities: 16
+
+  # Preserve each source riff's tempo; observed values fit safely in 40-250 BPM.
+  use_tempos: true
+  num_tempos: 32
+  tempo_min: 40
+  tempo_max: 250
+
+  # Keep a terminal Bar event so phrase endings survive encode/decode cleanly.
+  add_trailing_bars: true
+  max_bar_embedding: null

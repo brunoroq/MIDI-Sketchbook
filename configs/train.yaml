@@ -1,5 +1,5 @@
 # FUTURE-STAGE PLACEHOLDER
-# Training is not implemented in Stage 1. These values document the intended
+# Training is not implemented in Stages 1-2. These values document the intended
 # small-GRU baseline and will become an executable contract in a later stage.
 status: planned
 implemented: false
@@ -8,7 +8,8 @@ seed: 42
 device: auto  # Planned values: auto, cpu, or cuda.
 
 paths:
-  tokenized_dir: data/tokenized
+  # Stage 3 must consume the authoritative manifest, not glob old token runs.
+  tokenization_manifest: data/tokenized/manifest.json
   checkpoints_dir: checkpoints
   tensorboard_log_dir: outputs/logs
   resume_from: null
@@ -31,4 +32,3 @@ training:
   gradient_clip: 1.0
   mixed_precision: auto
   checkpoint_every_epochs: 1
-
