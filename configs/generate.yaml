@@ -1,6 +1,6 @@
 # FUTURE-STAGE PLACEHOLDER
-# Generation and token-to-MIDI decoding are not implemented in Stages 1-2. This
-# file records planned defaults; scripts/generate.py is not available yet.
+# Generation and token-to-MIDI decoding are not implemented through Stage 3.
+# This file records planned defaults; scripts/generate.py is not available yet.
 status: planned
 implemented: false
 

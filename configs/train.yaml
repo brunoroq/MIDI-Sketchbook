@@ -1,34 +1,36 @@
-# FUTURE-STAGE PLACEHOLDER
-# Training is not implemented in Stages 1-2. These values document the intended
-# small-GRU baseline and will become an executable contract in a later stage.
-status: planned
-implemented: false
-
+# Stage 3 executable training configuration.
+# Relative paths are resolved from the repository root, not from this file.
 seed: 42
-device: auto  # Planned values: auto, cpu, or cuda.
+device: auto  # Supported: auto, cpu, or cuda.
 
 paths:
-  # Stage 3 must consume the authoritative manifest, not glob old token runs.
+  # Consume only sequences listed by the authoritative Stage 2 manifest.
   tokenization_manifest: data/tokenized/manifest.json
   checkpoints_dir: checkpoints
-  tensorboard_log_dir: outputs/logs
+  tensorboard_log_dir: outputs/logs/training
+  # Must be a run's latest.pt inside checkpoints_dir when set.
   resume_from: null
 
 model:
   architecture: gru
-  embedding_dim: 128
-  hidden_dim: 256
+  embedding_dim: 64
+  hidden_dim: 128
   num_layers: 2
   dropout: 0.2
 
 data:
-  sequence_length: 256
+  # The longest current riff is 352 tokens; 384 avoids truncating it.
+  max_sequence_length: 384
   batch_size: 4
   num_workers: 0
 
 training:
   epochs: 50
   learning_rate: 0.0003
+  weight_decay: 0.0001
   gradient_clip: 1.0
+  # Supported: auto, on, or off. Auto enables it only on compatible CUDA.
   mixed_precision: auto
   checkpoint_every_epochs: 1
+  early_stopping_patience: 8
+  early_stopping_min_delta: 0.0001
