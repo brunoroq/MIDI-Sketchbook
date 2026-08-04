@@ -16,7 +16,9 @@ from midi_idea_generator.midi_io import (
     write_midi,
 )
 from midi_idea_generator.preprocessing import (
+    QuantizationCollisionError,
     build_single_track_midi,
+    normalize_instrument,
     quantization_step_seconds,
     quantize_instrument,
     remove_initial_silence,
@@ -58,6 +60,44 @@ def test_remove_initial_silence_shifts_copy_without_mutating_source(
     assert shifted_by_pitch[67].start == pytest.approx(1.0)
     assert shifted_by_pitch[67].end == pytest.approx(1.75)
     assert shifted_by_pitch[60].velocity == 100
+
+
+def test_normalization_collapses_only_duplicates_present_in_source(
+    make_instrument,
+) -> None:
+    source = make_instrument(
+        [
+            (59, 0.0, 0.25, 76),
+            (59, 0.0, 0.25, 76),
+            (59, 0.0, 0.5, 76),
+            (59, 0.0, 0.25, 77),
+        ]
+    )
+
+    normalized = normalize_instrument(
+        source,
+        tempo_bpm=120.0,
+        config=ProcessingConfig(remove_initial_silence=False, quantize=False),
+    )
+
+    assert len(source.notes) == 4
+    assert _note_snapshot(normalized) == [
+        (59, 76, 0.0, 0.25),
+        (59, 77, 0.0, 0.25),
+        (59, 76, 0.0, 0.5),
+    ]
+
+
+def test_quantization_rejects_new_exact_note_collisions(make_instrument) -> None:
+    source = make_instrument(
+        [
+            (60, 0.01, 0.03, 90),
+            (60, 0.04, 0.06, 90),
+        ]
+    )
+
+    with pytest.raises(QuantizationCollisionError, match="distinct notes"):
+        quantize_instrument(source, tempo_bpm=120.0, subdivisions_per_beat=4)
 
 
 def test_quantization_uses_half_up_rounding_and_one_cell_minimum_duration(

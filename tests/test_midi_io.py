@@ -129,6 +129,47 @@ def test_inspection_rejects_control_changes_that_would_be_lost(
     )
 
 
+def test_inspection_accepts_guitar_pro_pitch_bend_range_setup(
+    tmp_path: Path,
+    make_instrument,
+    write_midi_file,
+) -> None:
+    instrument = make_instrument([(60, 0.0, 1.0)])
+    instrument.control_changes.extend(
+        [
+            pretty_midi.ControlChange(number=101, value=0, time=0.0),
+            pretty_midi.ControlChange(number=100, value=0, time=0.0),
+            pretty_midi.ControlChange(number=6, value=6, time=0.0),
+        ]
+    )
+    path = write_midi_file(tmp_path / "guitar-pro-rpn.mid", [instrument])
+
+    inspection = inspect_midi(path, ValidationConfig())
+
+    assert inspection.compatible is True
+    assert inspection.tracks[0].issues == ()
+
+
+def test_inspection_accepts_neutral_pitchwheel_resets(
+    tmp_path: Path,
+    make_instrument,
+    write_midi_file,
+) -> None:
+    instrument = make_instrument([(60, 0.0, 1.0)])
+    instrument.pitch_bends.extend(
+        [
+            pretty_midi.PitchBend(pitch=0, time=0.0),
+            pretty_midi.PitchBend(pitch=0, time=0.5),
+        ]
+    )
+    path = write_midi_file(tmp_path / "neutral-pitchwheel.mid", [instrument])
+
+    inspection = inspect_midi(path, ValidationConfig())
+
+    assert inspection.compatible is True
+    assert inspection.tracks[0].has_pitch_bends is False
+
+
 def test_inspection_rejects_lyrics(
     tmp_path: Path,
     make_instrument,
@@ -257,6 +298,58 @@ def test_atomic_writer_rejects_ambiguous_same_pitch_overlap(
         write_midi(midi, output)
 
     assert not output.exists()
+
+
+def test_inspection_accepts_exact_duplicate_unison_note_events(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "duplicate-unison.mid"
+    raw = mido.MidiFile(type=0, ticks_per_beat=480)
+    raw.tracks.append(
+        mido.MidiTrack(
+            [
+                mido.MetaMessage("set_tempo", tempo=500_000, time=0),
+                mido.MetaMessage(
+                    "time_signature", numerator=4, denominator=4, time=0
+                ),
+                mido.Message("note_on", note=59, velocity=76, time=0),
+                mido.Message("note_on", note=59, velocity=76, time=0),
+                mido.Message("note_off", note=59, velocity=64, time=240),
+                mido.Message("note_off", note=59, velocity=64, time=0),
+            ]
+        )
+    )
+    raw.save(path)
+
+    inspection = inspect_midi(path, ValidationConfig())
+
+    assert inspection.compatible is True
+    assert inspection.tracks[0].num_notes == 1
+    assert inspection.tracks[0].raw_note_events == 2
+    assert inspection.tracks[0].duplicate_notes_collapsed == 1
+
+
+def test_inspection_rejects_simultaneous_duplicates_with_different_ends(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ambiguous-unison.mid"
+    raw = mido.MidiFile(type=0, ticks_per_beat=480)
+    raw.tracks.append(
+        mido.MidiTrack(
+            [
+                mido.Message("note_on", note=59, velocity=76, time=0),
+                mido.Message("note_on", note=59, velocity=76, time=0),
+                mido.Message("note_off", note=59, velocity=64, time=120),
+                mido.Message("note_off", note=59, velocity=64, time=120),
+            ]
+        )
+    )
+    raw.save(path)
+
+    inspection = inspect_midi(path, ValidationConfig())
+
+    assert inspection.compatible is False
+    assert "Overlapping note-on" in inspection.discard_reason
 
 
 def test_inspection_rejects_dangling_note_on(tmp_path: Path) -> None:

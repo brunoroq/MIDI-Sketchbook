@@ -89,7 +89,7 @@ def test_pipeline_continues_past_corrupt_midi_and_writes_complete_manifest(
         project_root / "data/splits/manifest.json"
     ).resolve()
     manifest = json.loads(report.manifest_path.read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 1
+    assert manifest["schema_version"] == 2
     assert manifest["random_seed"] == 99
     assert manifest["summary"] == {
         "compatible_sources": 1,
@@ -110,6 +110,8 @@ def test_pipeline_continues_past_corrupt_midi_and_writes_complete_manifest(
     assert valid["tempo_bpm"] == pytest.approx(120.0)
     assert valid["time_signature"] == "4/4"
     assert valid["num_notes"] == 2
+    assert valid["raw_note_events"] == 2
+    assert valid["duplicate_notes_collapsed"] == 0
     assert valid["num_base_fragments"] == 1
     assert valid["num_fragments_generated"] == 3
     assert corrupt["compatible"] is False
@@ -282,3 +284,44 @@ def test_write_failures_are_path_free_and_manifest_is_reproducible(
         "reason" in failure
         for failure in manifest["sources"][0]["write_errors"]
     )
+
+
+def test_quantization_collision_discards_only_the_affected_source(
+    tmp_path: Path,
+    make_instrument,
+    write_midi_file,
+) -> None:
+    project_root = tmp_path / "quantization-collision-project"
+    project_root.mkdir()
+    (project_root / "pyproject.toml").write_text(
+        "[project]\nname='quantization-collision-test'\n", encoding="utf-8"
+    )
+    raw_dir = project_root / "data/raw"
+    write_midi_file(
+        raw_dir / "colliding.mid",
+        [make_instrument([(60, 0.01, 0.03), (60, 0.04, 0.06)])],
+    )
+    write_midi_file(
+        raw_dir / "valid.mid",
+        [make_instrument([(64, 0.0, 0.25), (67, 0.25, 0.5)])],
+    )
+    base = load_preprocess_config(_write_pipeline_config(project_root))
+    config = replace(
+        base,
+        preprocessing=replace(base.preprocessing, remove_initial_silence=False),
+    )
+
+    report = run_preprocessing(config)
+    manifest = json.loads(report.manifest_path.read_text(encoding="utf-8"))
+    sources = {
+        Path(source["source_file"]).name: source for source in manifest["sources"]
+    }
+
+    assert report.compatible_sources == 1
+    assert report.discarded_sources == 1
+    assert report.generated_fragments == 3
+    assert sources["colliding.mid"]["compatible"] is False
+    assert "Quantization mapped distinct notes" in sources["colliding.mid"][
+        "discard_reason"
+    ]
+    assert sources["valid.mid"]["compatible"] is True

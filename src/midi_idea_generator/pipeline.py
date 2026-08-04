@@ -28,12 +28,16 @@ from .midi_io import (
     read_midi,
     write_midi,
 )
-from .preprocessing import normalize_instrument, split_instrument_into_phrases
+from .preprocessing import (
+    QuantizationCollisionError,
+    normalize_instrument,
+    split_instrument_into_phrases,
+)
 from .splitting import assign_source_splits
 from .utils import relative_label, write_json
 
 LOGGER = logging.getLogger(__name__)
-PIPELINE_SCHEMA_VERSION = 1
+PIPELINE_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +119,10 @@ def _source_record(
         "duration_seconds": inspection.duration_seconds,
         "resolution": inspection.resolution,
         "num_notes": track.num_notes if track else None,
+        "raw_note_events": track.raw_note_events if track else None,
+        "duplicate_notes_collapsed": (
+            track.duplicate_notes_collapsed if track else None
+        ),
         "num_base_fragments": 0,
         "num_fragments_generated": 0,
         "compatible": inspection.compatible,
@@ -332,9 +340,15 @@ def _process_sources(
         normalized_source_duration = max(
             0.0, get_midi_duration_seconds(midi) - initial_silence
         )
-        normalized = normalize_instrument(
-            instrument, inspection.tempo_bpm, config.preprocessing
-        )
+        try:
+            normalized = normalize_instrument(
+                instrument, inspection.tempo_bpm, config.preprocessing
+            )
+        except QuantizationCollisionError as exc:
+            reason = str(exc)
+            _mark_discarded(record, reason)
+            LOGGER.warning("Discarded %s: %s", source_label, reason)
+            continue
         phrases = split_instrument_into_phrases(
             normalized,
             inspection.tempo_bpm,

@@ -26,6 +26,8 @@ preprocessing. The executable workflow can:
 - select either the non-drum `pretty_midi` instrument stream with the most
   notes or an explicit instrument index;
 - remove initial silence and optionally quantize note onsets and durations;
+- strip Guitar Pro's inert time-zero pitch-bend-range setup and collapse exact
+  duplicate unison notes while retaining strict checks for musical controls;
 - split material into configurable phrases of 2, 4, or 8 bars;
 - assign each source file to exactly one train, validation, or test split
   before creating phrases, grouping byte-identical sources to prevent
@@ -198,7 +200,7 @@ Run the test suite:
 python -m pytest
 ```
 
-The current suite contains 66 synthetic tests and writes all MIDI fixtures to
+The current suite contains 73 synthetic tests and writes all MIDI fixtures to
 temporary directories; no dataset MIDI is committed.
 
 There is intentionally no working `train.py` or `generate.py` command in
@@ -218,14 +220,16 @@ must not be saved. None of this behavior is available in Stage 1.
 
 - Only one selected instrumental track is retained per source example.
 - The supported meter is 4/4 and tempo must remain constant within a source.
-- Pitch bends, lyrics, audio, and guitar fingering are outside the current
-  scope.
+- Non-neutral pitch bends, lyrics, audio, and guitar fingering are outside the
+  current scope; pitchwheel reset events at value zero are harmlessly removed.
 - Rhythm augmentation is not implemented.
 - Simple polyphony is accepted, but complex multi-track arrangement semantics
   are not preserved.
-- Overlapping note-on events for the same pitch/channel and dangling notes are
-  rejected because their Standard MIDI File interpretation is ambiguous.
-- Control changes are rejected rather than silently discarded; sustain-pedal
+- Exact duplicate unisons are collapsed. Non-identical overlapping note-on
+  events for the same pitch/channel and dangling notes remain rejected because
+  their Standard MIDI File interpretation is ambiguous.
+- Control changes are rejected rather than silently discarded, except for the
+  exact time-zero pitch-bend-range RPN emitted by Guitar Pro; sustain-pedal
   rendering is not implemented yet.
 - Final phrase completeness is measured with the source End-of-Track duration,
   and generated phrase files preserve trailing rests up to their nominal
@@ -286,6 +290,9 @@ preprocesamiento básico. El flujo ejecutable permite:
 - seleccionar el flujo instrumental no percusivo de `pretty_midi` con más
   notas o un índice de instrumento explícito;
 - eliminar el silencio inicial y cuantizar opcionalmente inicios y duraciones;
+- quitar la configuración inerte de rango de pitch bend que Guitar Pro escribe
+  al inicio y colapsar unísonos duplicados exactos, manteniendo controles
+  estrictos para eventos musicales;
 - dividir el material en frases configurables de 2, 4 u 8 compases;
 - asignar cada archivo fuente a un único split de entrenamiento, validación o
   prueba antes de fragmentarlo y agrupar fuentes idénticas byte a byte para
@@ -460,7 +467,7 @@ Ejecuta los tests:
 python -m pytest
 ```
 
-La suite actual contiene 66 tests sintéticos y escribe todos los fixtures MIDI
+La suite actual contiene 73 tests sintéticos y escribe todos los fixtures MIDI
 en directorios temporales; no se versiona ningún MIDI de dataset.
 
 En la Etapa 1 no existe un comando funcional `train.py` ni `generate.py`. Sus
@@ -480,15 +487,17 @@ funciones está disponible en la Etapa 1.
 
 - Se conserva una sola pista instrumental por ejemplo fuente.
 - Solo se admite compás 4/4 y el tempo debe ser constante.
-- Pitch bends, letras, audio y digitaciones de guitarra quedan fuera del
-  alcance actual.
+- Pitch bends no neutros, letras, audio y digitaciones de guitarra quedan fuera
+  del alcance actual; los resets de pitchwheel con valor cero se eliminan.
 - El aumento rítmico no está implementado.
 - Se acepta polifonía sencilla, pero no se conserva la semántica de arreglos
   multipista complejos.
-- Se rechazan note-on superpuestos del mismo pitch/canal y notas colgantes,
-  porque su interpretación en Standard MIDI File es ambigua.
-- Los control changes se rechazan en vez de descartarlos silenciosamente; aún
-  no se renderiza el pedal de sustain.
+- Los unísonos duplicados exactos se colapsan. Se siguen rechazando note-on no
+  idénticos superpuestos del mismo pitch/canal y notas colgantes, porque su
+  interpretación en Standard MIDI File es ambigua.
+- Los control changes se rechazan en vez de descartarlos silenciosamente, salvo
+  el RPN exacto de rango de pitch bend que Guitar Pro escribe al inicio; aún no
+  se renderiza el pedal de sustain.
 - La completitud de la última frase usa la duración End-of-Track de la fuente y
   los fragmentos preservan silencios finales hasta el límite nominal de 2/4/8
   compases.

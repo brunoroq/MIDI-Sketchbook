@@ -9,7 +9,7 @@ from typing import Iterable
 import pretty_midi
 
 from .config import ProcessingConfig
-from .midi_io import set_midi_duration_seconds
+from .midi_io import exact_note_identity, set_midi_duration_seconds
 
 TICKS_PER_BEAT = 480
 BEATS_PER_BAR_4_4 = 4
@@ -23,6 +23,10 @@ class MidiPhrase:
     midi: pretty_midi.PrettyMIDI
     num_notes: int
     nominal_duration_seconds: float
+
+
+class QuantizationCollisionError(ValueError):
+    """Raised when distinct source notes become one ambiguous grid event."""
 
 
 def clone_note(
@@ -59,6 +63,17 @@ def clone_instrument(
         key=lambda note: (note.start, note.pitch, note.end, note.velocity),
     )
     return cloned
+
+
+def deduplicate_exact_notes(
+    instrument: pretty_midi.Instrument,
+) -> pretty_midi.Instrument:
+    """Collapse only note events already identical in the source MIDI."""
+
+    unique_notes: dict[tuple[int, int, float, float], pretty_midi.Note] = {}
+    for note in instrument.notes:
+        unique_notes.setdefault(exact_note_identity(note), note)
+    return clone_instrument(instrument, unique_notes.values())
 
 
 def remove_initial_silence(
@@ -105,11 +120,22 @@ def quantize_instrument(
 
     step = quantization_step_seconds(tempo_bpm, subdivisions_per_beat)
     quantized: list[pretty_midi.Note] = []
+    identities: set[tuple[int, int, float, float]] = set()
     for note in instrument.notes:
         onset_cells = _round_half_up(note.start / step)
         duration_cells = max(1, _round_half_up((note.end - note.start) / step))
         start = onset_cells * step
-        quantized.append(clone_note(note, start=start, end=start + duration_cells * step))
+        quantized_note = clone_note(
+            note, start=start, end=start + duration_cells * step
+        )
+        identity = exact_note_identity(quantized_note)
+        if identity in identities:
+            raise QuantizationCollisionError(
+                "Quantization mapped distinct notes to the same pitch, velocity, "
+                "onset, and duration"
+            )
+        identities.add(identity)
+        quantized.append(quantized_note)
     return clone_instrument(instrument, quantized)
 
 
@@ -120,7 +146,7 @@ def normalize_instrument(
 ) -> pretty_midi.Instrument:
     """Remove unsupported events, optionally shift silence, and quantize."""
 
-    normalized = clone_instrument(instrument)
+    normalized = deduplicate_exact_notes(instrument)
     if config.remove_initial_silence:
         normalized = remove_initial_silence(normalized)
     if config.quantize:

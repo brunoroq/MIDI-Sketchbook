@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import copy
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 import logging
 import os
 from pathlib import Path
 import tempfile
 from typing import Any
+import warnings
 
 import mido
 import numpy as np
@@ -19,6 +21,8 @@ from .config import TrackSelectionConfig, ValidationConfig
 LOGGER = logging.getLogger(__name__)
 MIDI_EXTENSIONS = {".mid", ".midi"}
 _DURATION_ATTRIBUTE = "_midi_idea_duration_seconds"
+_GUITAR_PRO_PITCH_BEND_RANGE_RPN = ((101, 0), (100, 0), (6, 6))
+_EVENT_TIME_TOLERANCE_SECONDS = 1e-9
 
 
 class MidiReadError(ValueError):
@@ -62,6 +66,12 @@ def get_midi_duration_seconds(midi: pretty_midi.PrettyMIDI) -> float:
     return float(midi.get_end_time() if stored is None else stored)
 
 
+def exact_note_identity(note: pretty_midi.Note) -> tuple[int, int, float, float]:
+    """Return the fields that make two note events exactly redundant."""
+
+    return (int(note.pitch), int(note.velocity), float(note.start), float(note.end))
+
+
 @dataclass(frozen=True, slots=True)
 class TrackInspection:
     """Validation metadata for one ``pretty_midi`` instrument."""
@@ -71,6 +81,8 @@ class TrackInspection:
     program: int
     is_drum: bool
     num_notes: int
+    raw_note_events: int
+    duplicate_notes_collapsed: int
     min_pitch: int | None
     max_pitch: int | None
     has_pitch_bends: bool
@@ -148,6 +160,77 @@ def discover_midi_files(input_dir: str | Path) -> list[Path]:
     )
 
 
+def _raise_overlapping_notes(midi_path: Path, track_number: int) -> None:
+    raise UnsupportedMidiError(
+        f"Unsupported MIDI '{midi_path}': overlapping note-on "
+        f"events in raw track {track_number}",
+        "Overlapping note-on events for the same pitch/channel",
+    )
+
+
+def _validate_note_lifetimes(raw_midi: mido.MidiFile, midi_path: Path) -> None:
+    """Allow exact unison duplicates while rejecting ambiguous overlaps."""
+
+    for track_number, track in enumerate(raw_midi.tracks):
+        absolute_tick = 0
+        active_notes: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        duplicate_counts: dict[tuple[int, int, int, int], int] = defaultdict(int)
+        duplicate_ends: dict[tuple[int, int, int, int], list[int]] = defaultdict(list)
+
+        for message in track:
+            absolute_tick += int(message.time)
+            if message.type == "note_on" and message.velocity > 0:
+                key = (message.channel, message.note)
+                active = active_notes.setdefault(key, [])
+                if active and any(
+                    start != absolute_tick or velocity != message.velocity
+                    for start, velocity in active
+                ):
+                    _raise_overlapping_notes(midi_path, track_number)
+                active.append((absolute_tick, message.velocity))
+                group = (*key, absolute_tick, message.velocity)
+                duplicate_counts[group] += 1
+            elif message.type == "note_off" or (
+                message.type == "note_on" and message.velocity == 0
+            ):
+                key = (message.channel, message.note)
+                active = active_notes.get(key)
+                if active:
+                    start, velocity = active.pop(0)
+                    duplicate_ends[(*key, start, velocity)].append(absolute_tick)
+                    if not active:
+                        del active_notes[key]
+
+        if active_notes:
+            raise UnsupportedMidiError(
+                f"Unsupported MIDI '{midi_path}': dangling note-on events "
+                f"in raw track {track_number}",
+                "Dangling note-on events without matching note-off",
+            )
+
+        for group, count in duplicate_counts.items():
+            if count <= 1:
+                continue
+            end_ticks = duplicate_ends[group]
+            if len(end_ticks) != count or len(set(end_ticks)) != 1:
+                _raise_overlapping_notes(midi_path, track_number)
+
+
+def _is_guitar_pro_pitch_bend_range_setup(
+    control_changes: list[pretty_midi.ControlChange],
+) -> bool:
+    """Recognize Guitar Pro's inert, time-zero pitch-bend range RPN."""
+
+    return (
+        tuple(sorted((change.number, change.value) for change in control_changes))
+        == tuple(sorted(_GUITAR_PRO_PITCH_BEND_RANGE_RPN))
+        and all(
+            abs(change.time) <= _EVENT_TIME_TOLERANCE_SECONDS
+            for change in control_changes
+        )
+    )
+
+
 def read_midi(path: str | Path) -> pretty_midi.PrettyMIDI:
     """Parse one MIDI file, wrapping parser failures with path context."""
 
@@ -198,28 +281,7 @@ def read_midi(path: str | Path) -> pretty_midi.PrettyMIDI:
                 "appears outside track 0",
                 f"Global metadata appears outside track 0: {events}",
             )
-    for track_number, track in enumerate(raw_midi.tracks):
-        active_notes: set[tuple[int, int]] = set()
-        for message in track:
-            if message.type == "note_on" and message.velocity > 0:
-                key = (message.channel, message.note)
-                if key in active_notes:
-                    raise UnsupportedMidiError(
-                        f"Unsupported MIDI '{midi_path}': overlapping note-on "
-                        f"events in raw track {track_number}",
-                        "Overlapping note-on events for the same pitch/channel",
-                    )
-                active_notes.add(key)
-            elif message.type == "note_off" or (
-                message.type == "note_on" and message.velocity == 0
-            ):
-                active_notes.discard((message.channel, message.note))
-        if active_notes:
-            raise UnsupportedMidiError(
-                f"Unsupported MIDI '{midi_path}': dangling note-on events "
-                f"in raw track {track_number}",
-                "Dangling note-on events without matching note-off",
-            )
+    _validate_note_lifetimes(raw_midi, midi_path)
     duration_midi = copy.deepcopy(raw_midi)
     for track in duration_midi.tracks:
         for message in track:
@@ -229,7 +291,20 @@ def read_midi(path: str | Path) -> pretty_midi.PrettyMIDI:
                 message.time = 0
     raw_duration_seconds = float(duration_midi.length)
     try:
-        midi = pretty_midi.PrettyMIDI(mido_object=raw_midi)
+        with warnings.catch_warnings():
+            # Type-1 Guitar Pro exports place key signatures on the musical
+            # track. Tempo and meter placement were already validated above;
+            # key signatures are intentionally unused by this note-only stage.
+            warnings.filterwarnings(
+                "ignore",
+                message=(
+                    r"Tempo, Key or Time signature change events found on "
+                    r"non-zero tracks\..*"
+                ),
+                category=RuntimeWarning,
+                module=r"pretty_midi\.pretty_midi",
+            )
+            midi = pretty_midi.PrettyMIDI(mido_object=raw_midi)
     except Exception as exc:
         # pretty_midi can surface several parser exception types. This is the
         # deliberate file-format fault boundary; the cause is retained in logs.
@@ -427,13 +502,16 @@ def inspect_track(
     """Inspect an instrument track against stage-one constraints."""
 
     notes = instrument.notes
+    unique_note_count = len({exact_note_identity(note) for note in notes})
+    duplicate_note_count = len(notes) - unique_note_count
     pitches = [int(note.pitch) for note in notes]
     issues: list[str] = []
     if config.exclude_drums and instrument.is_drum:
         issues.append("Drum tracks are excluded")
-    if len(notes) < config.min_notes_per_track:
+    if unique_note_count < config.min_notes_per_track:
         issues.append(
-            f"Track has {len(notes)} notes; minimum is {config.min_notes_per_track}"
+            f"Track has {unique_note_count} unique notes; "
+            f"minimum is {config.min_notes_per_track}"
         )
     if pitches:
         minimum = min(pitches)
@@ -445,9 +523,14 @@ def inspect_track(
             )
     else:
         minimum = maximum = None
-    if config.reject_pitch_bends and instrument.pitch_bends:
+    expressive_pitch_bends = [
+        bend for bend in instrument.pitch_bends if bend.pitch != 0
+    ]
+    if config.reject_pitch_bends and expressive_pitch_bends:
         issues.append("Track contains pitch bends")
-    if instrument.control_changes:
+    if instrument.control_changes and not _is_guitar_pro_pitch_bend_range_setup(
+        instrument.control_changes
+    ):
         issues.append("Track contains unsupported MIDI control changes")
     invalid_notes = sum(
         1
@@ -463,10 +546,12 @@ def inspect_track(
         name=str(instrument.name),
         program=int(instrument.program),
         is_drum=bool(instrument.is_drum),
-        num_notes=len(notes),
+        num_notes=unique_note_count,
+        raw_note_events=len(notes),
+        duplicate_notes_collapsed=duplicate_note_count,
         min_pitch=minimum,
         max_pitch=maximum,
-        has_pitch_bends=bool(instrument.pitch_bends),
+        has_pitch_bends=bool(expressive_pitch_bends),
         valid=not issues,
         issues=tuple(issues),
     )
