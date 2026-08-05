@@ -134,6 +134,51 @@ def test_breakdown_is_by_target_type_and_includes_clear_absences() -> None:
     assert breakdown["Bar"].token_top5_accuracy is None
 
 
+def test_prompt_targets_are_excluded_from_total_and_type_metrics() -> None:
+    token_types = (
+        "PAD",
+        "BOS",
+        "Tonic",
+        "Mode",
+        "Bar",
+        "Pitch",
+        "Technique",
+    )
+    accumulator = TrainingMetricsAccumulator(
+        pad_token_id=0,
+        technique_token_ids=(6,),
+        token_type_by_id=token_types,
+        ignored_target_token_ids=(2, 3),
+    )
+    logits = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0],
+                [0.0, 3.0, 2.0, 1.0, 5.0, 0.0, -1.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    targets = torch.tensor([[2, 3, 4]], dtype=torch.long)
+    unknown = torch.zeros((1, 3), dtype=torch.bool)
+
+    accumulator.update(logits, targets, unknown)
+    report = accumulator.snapshot()
+
+    expected = torch.nn.functional.cross_entropy(
+        logits[:, 2, :], torch.tensor([4]), reduction="mean"
+    )
+    assert accumulator.ignored_target_token_ids == (2, 3)
+    assert report.total.count == 1
+    assert report.total.objective_nll == pytest.approx(float(expected))
+    assert report.by_target_type["Bar"].count == 1
+    assert report.by_target_type["Tonic"].count == 0
+    assert report.by_target_type["Tonic"].objective_nll is None
+    assert report.by_target_type["Mode"].count == 0
+    assert report.by_target_type["Mode"].token_top1_accuracy is None
+
+
 def test_accumulation_across_batches_is_token_weighted() -> None:
     logits, targets, unknown = _batch()
     combined = _accumulator()
@@ -197,6 +242,7 @@ def test_reset_clears_counts_without_changing_contract() -> None:
     assert accumulator.vocabulary_size == len(TOKEN_TYPES)
     assert accumulator.pad_token_id == 0
     assert accumulator.technique_token_ids == TECHNIQUE_IDS
+    assert accumulator.ignored_target_token_ids == ()
 
 
 def test_report_is_strict_jsonable_and_deterministic() -> None:
@@ -239,6 +285,39 @@ def test_report_is_strict_jsonable_and_deterministic() -> None:
         (
             lambda: TrainingMetricsAccumulator(0, (1,), TOKEN_TYPES),
             "token type 'Technique'",
+        ),
+        (
+            lambda: TrainingMetricsAccumulator(
+                0, TECHNIQUE_IDS, TOKEN_TYPES, ignored_target_token_ids=(0,)
+            ),
+            "PAD",
+        ),
+        (
+            lambda: TrainingMetricsAccumulator(
+                0, TECHNIQUE_IDS, TOKEN_TYPES, ignored_target_token_ids=(1, 1)
+            ),
+            "distinct",
+        ),
+        (
+            lambda: TrainingMetricsAccumulator(
+                0, TECHNIQUE_IDS, TOKEN_TYPES, ignored_target_token_ids=(True,)
+            ),
+            "integer token ID",
+        ),
+        (
+            lambda: TrainingMetricsAccumulator(
+                0,
+                TECHNIQUE_IDS,
+                TOKEN_TYPES,
+                ignored_target_token_ids=(len(TOKEN_TYPES),),
+            ),
+            "range",
+        ),
+        (
+            lambda: TrainingMetricsAccumulator(
+                0, TECHNIQUE_IDS, TOKEN_TYPES, ignored_target_token_ids="Tonic"
+            ),
+            "collection",
         ),
         (
             lambda: TrainingMetricsAccumulator(
@@ -308,4 +387,17 @@ def test_update_rejects_invalid_batches(mutation: str, message: str) -> None:
         logits[0, 0, 0] = float("inf")
 
     with pytest.raises(TrainingMetricsError, match=message):
+        accumulator.update(logits, targets, unknown)
+
+
+def test_update_rejects_unknown_mask_on_ignored_target() -> None:
+    accumulator = TrainingMetricsAccumulator(
+        0,
+        TECHNIQUE_IDS,
+        TOKEN_TYPES,
+        ignored_target_token_ids=(2,),
+    )
+    logits, targets, unknown = _batch()
+
+    with pytest.raises(TrainingMetricsError, match="ignored target"):
         accumulator.update(logits, targets, unknown)

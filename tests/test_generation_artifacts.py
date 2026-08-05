@@ -42,6 +42,8 @@ def _decoded_fixture(
     *,
     bends: bool,
     techniques: tuple[TechniqueAnnotation, ...],
+    tonic: str = "UNKNOWN",
+    mode: str = "UNKNOWN",
 ):
     tokenizer = build_tokenizer(RemiTokenizerConfig())
     instrument = make_instrument(
@@ -58,12 +60,67 @@ def _decoded_fixture(
             ]
         )
     source = write_midi_file(tmp_path / "source.mid", [instrument])
-    encoded = encode_midi(tokenizer, source, techniques=techniques)
+    encoded = encode_midi(
+        tokenizer,
+        source,
+        techniques=techniques,
+        tonic=tonic,
+        mode=mode,
+    )
     decoded = decode_symbolic_token_ids(
         tokenizer, encoded.ids, encoded.programs
     )
     token_strings = tuple(tokenizer[token_id] for token_id in encoded.ids)
     return tokenizer, encoded, decoded, token_strings
+
+
+def test_conditioning_stays_in_tokens_and_does_not_invent_midi_key_signature(
+    tmp_path: Path,
+    make_instrument,
+    write_midi_file,
+) -> None:
+    _, encoded, decoded, token_strings = _decoded_fixture(
+        tmp_path,
+        make_instrument,
+        write_midi_file,
+        bends=False,
+        techniques=(),
+        tonic="E",
+        mode="PHRYGIAN",
+    )
+
+    report = write_generation_artifacts(
+        decoded,
+        encoded.ids,
+        token_strings,
+        {
+            "generation_mode": "tonality_conditioned",
+            "conditioning": {
+                "tonic": "E",
+                "mode": "PHRYGIAN",
+                "tonic_token": "Tonic_E",
+                "mode_token": "Mode_PHRYGIAN",
+            },
+        },
+        tmp_path / "conditioned",
+        program=30,
+        visualization_enabled=False,
+    )
+
+    token_payload = json.loads(report.tokens.path.read_text(encoding="utf-8"))
+    assert token_payload["tokens"][:3] == [
+        "BOS_None",
+        "Tonic_E",
+        "Mode_PHRYGIAN",
+    ]
+    assert token_payload["provenance"]["conditioning"]["tonic"] == "E"
+    assert token_payload["provenance"]["conditioning"]["mode"] == "PHRYGIAN"
+    raw_midi = mido.MidiFile(report.midi.path, clip=False)
+    assert not any(
+        message.type == "key_signature"
+        for track in raw_midi.tracks
+        for message in track
+    )
 
 
 def test_writes_exact_midi_tokens_and_generated_technique_sidecar(

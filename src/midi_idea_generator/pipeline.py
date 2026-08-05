@@ -49,10 +49,19 @@ from .techniques import (
     load_technique_sidecar,
     sidecar_path_for,
 )
+from .tonality import (
+    SIDECAR_SUFFIX as TONALITY_SIDECAR_SUFFIX,
+    Tonality,
+    TonalitySidecar,
+    TonalitySidecarError,
+    infer_tonality,
+    load_tonality_sidecar,
+    sidecar_path_for as tonality_sidecar_path_for,
+)
 from .utils import relative_label, write_json
 
 LOGGER = logging.getLogger(__name__)
-PIPELINE_SCHEMA_VERSION = 3
+PIPELINE_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +75,15 @@ class SourceFingerprint:
 @dataclass(frozen=True, slots=True)
 class TechniqueSidecarInput:
     """Captured optional-sidecar state used for reproducibility checks."""
+
+    path: Path
+    present: bool
+    fingerprint: SourceFingerprint | None
+
+
+@dataclass(frozen=True, slots=True)
+class TonalitySidecarInput:
+    """Captured optional tonality-sidecar state for reproducibility checks."""
 
     path: Path
     present: bool
@@ -123,6 +141,8 @@ def _source_record(
     canonical_pitch_bend_range_semitones: int,
     sidecar_input: TechniqueSidecarInput,
     sidecar_label: str,
+    tonality_sidecar_input: TonalitySidecarInput,
+    tonality_sidecar_label: str,
 ) -> dict[str, Any]:
     track = (
         inspection.tracks[inspection.selected_track]
@@ -180,6 +200,20 @@ def _source_record(
         "technique_annotation_count": 0,
         "technique_counts": source_technique_counts(None),
         "palm_mute_range_count": 0,
+        "tonality_sidecar": (
+            tonality_sidecar_label if tonality_sidecar_input.present else None
+        ),
+        "tonality_sidecar_sha256": (
+            tonality_sidecar_input.fingerprint.sha256
+            if tonality_sidecar_input.fingerprint is not None
+            else None
+        ),
+        "tonality_sidecar_size_bytes": (
+            tonality_sidecar_input.fingerprint.size_bytes
+            if tonality_sidecar_input.fingerprint is not None
+            else None
+        ),
+        "tonality": Tonality.unknown().as_dict(),
         "num_base_fragments": 0,
         "num_fragments_generated": 0,
         "compatible": inspection.compatible,
@@ -231,6 +265,16 @@ def _capture_sidecar_input(midi_path: Path) -> TechniqueSidecarInput:
     )
 
 
+def _capture_tonality_sidecar_input(midi_path: Path) -> TonalitySidecarInput:
+    path = tonality_sidecar_path_for(midi_path)
+    present = path.exists() or path.is_symlink()
+    return TonalitySidecarInput(
+        path=path,
+        present=present,
+        fingerprint=_try_fingerprint(path) if present else None,
+    )
+
+
 def _validate_no_orphan_sidecars(input_dir: Path, midi_files: list[Path]) -> None:
     known_midis = set(midi_files)
     for path in sorted(input_dir.rglob(f"*{SIDECAR_SUFFIX}")):
@@ -245,6 +289,20 @@ def _validate_no_orphan_sidecars(input_dir: Path, midi_files: list[Path]) -> Non
         ):
             raise TechniqueSidecarError(
                 "Orphan technique sidecar has no discovered sibling MIDI: "
+                f"{path}"
+            )
+    for path in sorted(input_dir.rglob(f"*{TONALITY_SIDECAR_SUFFIX}")):
+        if not (path.is_file() or path.is_symlink()):
+            continue
+        midi_name = path.name[: -len(TONALITY_SIDECAR_SUFFIX)]
+        expected_midi = path.with_name(midi_name)
+        if (
+            expected_midi not in known_midis
+            or expected_midi.is_symlink()
+            or not expected_midi.is_file()
+        ):
+            raise TonalitySidecarError(
+                "Orphan tonality sidecar has no discovered sibling MIDI: "
                 f"{path}"
             )
 
@@ -263,9 +321,39 @@ def _populate_sidecar_record(
     record["palm_mute_range_count"] = len(sidecar.palm_mute_ranges)
 
 
+def _resolve_source_tonality(
+    sidecar: TonalitySidecar | None,
+    normalized_instrument: Any,
+    missing_sidecar_policy: str,
+) -> Tonality:
+    if sidecar is not None:
+        return sidecar.tonality
+    if missing_sidecar_policy == "unknown":
+        return Tonality.unknown()
+    # A source estimate remains useful provenance even when fragments will be
+    # conditioned by their own local estimates.
+    return infer_tonality(normalized_instrument, method="AUTO_SOURCE")
+
+
+def _resolve_phrase_tonality(
+    *,
+    sidecar: TonalitySidecar | None,
+    source_tonality: Tonality,
+    phrase: Any,
+    missing_sidecar_policy: str,
+) -> Tonality:
+    if sidecar is not None or missing_sidecar_policy != "infer_fragment":
+        return source_tonality
+    return infer_tonality(
+        phrase.midi.instruments[0],
+        method="AUTO_FRAGMENT",
+    )
+
+
 def _verify_captured_inputs(
     fingerprints: dict[Path, SourceFingerprint | None],
     sidecar_inputs: dict[Path, TechniqueSidecarInput],
+    tonality_sidecar_inputs: dict[Path, TonalitySidecarInput],
 ) -> None:
     changed_sources = [
         path
@@ -277,10 +365,22 @@ def _verify_captured_inputs(
         for path, expected in sidecar_inputs.items()
         if _capture_sidecar_input(path) != expected
     ]
-    if changed_sources or changed_sidecars:
-        labels = [path.name for path in (*changed_sources, *changed_sidecars)][:5]
+    changed_tonality_sidecars = [
+        path
+        for path, expected in tonality_sidecar_inputs.items()
+        if _capture_tonality_sidecar_input(path) != expected
+    ]
+    if changed_sources or changed_sidecars or changed_tonality_sidecars:
+        labels = [
+            path.name
+            for path in (
+                *changed_sources,
+                *changed_sidecars,
+                *changed_tonality_sidecars,
+            )
+        ][:5]
         raise RuntimeError(
-            "Raw MIDI or technique sidecar changed before publication: "
+            "Raw MIDI or annotation sidecar changed before publication: "
             + ", ".join(labels)
         )
 
@@ -292,6 +392,7 @@ def _config_snapshot(config: PreprocessConfig) -> dict[str, Any]:
         "track_selection": asdict(config.track_selection),
         "preprocessing": asdict(config.preprocessing),
         "augmentation": asdict(config.augmentation),
+        "tonality": asdict(config.tonality),
         "splits": asdict(config.splits),
     }
 
@@ -331,6 +432,7 @@ def _make_run_id(
     labels: dict[Path, str],
     fingerprints: dict[Path, SourceFingerprint | None],
     sidecar_inputs: dict[Path, TechniqueSidecarInput],
+    tonality_sidecar_inputs: dict[Path, TonalitySidecarInput],
     versions: dict[str, str],
 ) -> str:
     sources = [
@@ -347,6 +449,19 @@ def _make_run_id(
                 "size_bytes": (
                     sidecar_inputs[path].fingerprint.size_bytes
                     if sidecar_inputs[path].fingerprint is not None
+                    else None
+                ),
+            },
+            "tonality_sidecar": {
+                "present": tonality_sidecar_inputs[path].present,
+                "sha256": (
+                    tonality_sidecar_inputs[path].fingerprint.sha256
+                    if tonality_sidecar_inputs[path].fingerprint is not None
+                    else None
+                ),
+                "size_bytes": (
+                    tonality_sidecar_inputs[path].fingerprint.size_bytes
+                    if tonality_sidecar_inputs[path].fingerprint is not None
                     else None
                 ),
             },
@@ -419,6 +534,7 @@ def _process_sources(
     assignments: dict[str, str],
     fingerprints: dict[Path, SourceFingerprint | None],
     sidecar_inputs: dict[Path, TechniqueSidecarInput],
+    tonality_sidecar_inputs: dict[Path, TonalitySidecarInput],
     content_group_sizes: dict[Path, int],
     changed_sources: set[Path],
     staging_dir: Path,
@@ -432,6 +548,9 @@ def _process_sources(
         split = assignments.get(source_label)
         expected_fingerprint = fingerprints[inspection.source_file]
         expected_sidecar = sidecar_inputs[inspection.source_file]
+        expected_tonality_sidecar = tonality_sidecar_inputs[
+            inspection.source_file
+        ]
         record = _source_record(
             inspection,
             source_label,
@@ -441,6 +560,8 @@ def _process_sources(
             config.validation.canonical_pitch_bend_range_semitones,
             expected_sidecar,
             f"{source_label}{SIDECAR_SUFFIX}",
+            expected_tonality_sidecar,
+            f"{source_label}{TONALITY_SIDECAR_SUFFIX}",
         )
         source_records.append(record)
         if inspection.source_file in changed_sources:
@@ -505,6 +626,41 @@ def _process_sources(
             continue
         _populate_sidecar_record(record, sidecar)
 
+        try:
+            tonality_sidecar = load_tonality_sidecar(
+                inspection.source_file,
+                source_sha256=expected_fingerprint.sha256,
+                midi=midi,
+                instrument_index=inspection.selected_track,
+            )
+        except TonalitySidecarError as exc:
+            reason = f"Invalid tonality sidecar: {exc}"
+            _mark_discarded(record, reason)
+            LOGGER.warning("Discarded %s: %s", source_label, reason)
+            continue
+        loaded_tonality_fingerprint = (
+            SourceFingerprint(tonality_sidecar.sha256, tonality_sidecar.size_bytes)
+            if tonality_sidecar is not None
+            else None
+        )
+        if (
+            expected_tonality_sidecar.present != (tonality_sidecar is not None)
+            or expected_tonality_sidecar.fingerprint
+            != loaded_tonality_fingerprint
+        ):
+            reason = "Tonality sidecar changed while it was being loaded"
+            _mark_discarded(record, reason)
+            LOGGER.warning("Discarded %s: %s", source_label, reason)
+            continue
+        if (
+            _capture_tonality_sidecar_input(inspection.source_file)
+            != expected_tonality_sidecar
+        ):
+            reason = "Tonality sidecar changed during preprocessing"
+            _mark_discarded(record, reason)
+            LOGGER.warning("Discarded %s: %s", source_label, reason)
+            continue
+
         instrument = midi.instruments[inspection.selected_track]
         initial_silence = (
             min(note.start for note in instrument.notes)
@@ -533,6 +689,12 @@ def _process_sources(
             _mark_discarded(record, reason)
             LOGGER.warning("Discarded %s: %s", source_label, reason)
             continue
+        source_tonality = _resolve_source_tonality(
+            tonality_sidecar,
+            normalized,
+            config.tonality.missing_sidecar_policy,
+        )
+        record["tonality"] = source_tonality.as_dict()
         phrases = split_instrument_into_phrases(
             normalized,
             inspection.tempo_bpm,
@@ -555,9 +717,17 @@ def _process_sources(
         source_stem = _safe_source_stem(source_label)
         offsets = augmentation_offsets(config.augmentation, split)
         write_failures: list[dict[str, Any]] = []
-        variants: list[tuple[Any, int, Any, tuple[Any, ...]]] = []
+        variants: list[tuple[Any, int, Any, tuple[Any, ...], Tonality]] = []
         try:
             for phrase in phrases:
+                phrase_tonality = _resolve_phrase_tonality(
+                    sidecar=tonality_sidecar,
+                    source_tonality=source_tonality,
+                    phrase=phrase,
+                    missing_sidecar_policy=(
+                        config.tonality.missing_sidecar_policy
+                    ),
+                )
                 for semitones in offsets:
                     techniques = project_phrase_techniques(
                         source_midi=midi,
@@ -594,13 +764,21 @@ def _process_sources(
                             phrase.phrase_index,
                         )
                         continue
-                    variants.append((phrase, semitones, transposed, techniques))
+                    variants.append(
+                        (
+                            phrase,
+                            semitones,
+                            transposed,
+                            techniques,
+                            phrase_tonality.transposed(semitones),
+                        )
+                    )
         except TechniqueProjectionError as exc:
             reason = f"Could not project guitar techniques: {exc}"
             _mark_discarded(record, reason)
             LOGGER.warning("Discarded %s: %s", source_label, reason)
             continue
-        for phrase, semitones, transposed, techniques in variants:
+        for phrase, semitones, transposed, techniques, tonality in variants:
             filename = (
                 f"{source_stem}_phrase-{phrase.phrase_index:04d}_"
                 f"{_transpose_tag(semitones)}.mid"
@@ -652,6 +830,7 @@ def _process_sources(
                     ),
                     "technique_coverage": record["technique_coverage"],
                     "techniques": [technique.as_dict() for technique in techniques],
+                    "tonality": tonality.as_dict(),
                     "output_sha256": output_fingerprint.sha256,
                     "output_size_bytes": output_fingerprint.size_bytes,
                     "nominal_duration_seconds": phrase.nominal_duration_seconds,
@@ -680,6 +859,9 @@ def run_preprocessing(config: PreprocessConfig) -> PreprocessReport:
     _validate_no_orphan_sidecars(config.paths.input_dir, files)
     fingerprints = {path: _try_fingerprint(path) for path in files}
     sidecar_inputs = {path: _capture_sidecar_input(path) for path in files}
+    tonality_sidecar_inputs = {
+        path: _capture_tonality_sidecar_input(path) for path in files
+    }
     inspections = [
         inspect_midi(path, config.validation, config.track_selection)
         for path in files
@@ -690,6 +872,9 @@ def run_preprocessing(config: PreprocessConfig) -> PreprocessReport:
     sidecars_after_inspection = {
         path: _capture_sidecar_input(path) for path in files
     }
+    tonality_sidecars_after_inspection = {
+        path: _capture_tonality_sidecar_input(path) for path in files
+    }
     changed_sources = {
         path
         for path in files
@@ -697,6 +882,8 @@ def run_preprocessing(config: PreprocessConfig) -> PreprocessReport:
         or fingerprints_after_inspection[path] is None
         or fingerprints[path] != fingerprints_after_inspection[path]
         or sidecar_inputs[path] != sidecars_after_inspection[path]
+        or tonality_sidecar_inputs[path]
+        != tonality_sidecars_after_inspection[path]
     }
     labels = {
         inspection.source_file: _source_label(inspection.source_file, config)
@@ -734,6 +921,7 @@ def run_preprocessing(config: PreprocessConfig) -> PreprocessReport:
         labels,
         fingerprints,
         sidecar_inputs,
+        tonality_sidecar_inputs,
         tool_versions,
     )
     final_run_dir = config.paths.processed_dir / "runs" / run_id
@@ -747,6 +935,7 @@ def run_preprocessing(config: PreprocessConfig) -> PreprocessReport:
             assignments,
             fingerprints,
             sidecar_inputs,
+            tonality_sidecar_inputs,
             content_group_sizes,
             changed_sources,
             staging_dir,
@@ -757,7 +946,11 @@ def run_preprocessing(config: PreprocessConfig) -> PreprocessReport:
         if current_files != files:
             raise RuntimeError("Raw MIDI inventory changed before publication.")
         _validate_no_orphan_sidecars(config.paths.input_dir, current_files)
-        _verify_captured_inputs(fingerprints, sidecar_inputs)
+        _verify_captured_inputs(
+            fingerprints,
+            sidecar_inputs,
+            tonality_sidecar_inputs,
+        )
         manifest = {
             "schema_version": PIPELINE_SCHEMA_VERSION,
             "run_id": run_id,

@@ -19,10 +19,12 @@ from pathlib import Path, PurePosixPath
 import re
 from typing import Any
 
+from .tonality import MODE_NAMES, TONALITY_METHODS, TONIC_NAMES, Tonality, TonalityError
 
-TOKENIZATION_MANIFEST_SCHEMA_VERSION = 2
-TOKEN_SEQUENCE_SCHEMA_VERSION = 2
-PREPROCESSING_MANIFEST_SCHEMA_VERSION = 3
+TOKENIZATION_MANIFEST_SCHEMA_VERSION = 3
+TOKEN_SEQUENCE_SCHEMA_VERSION = 3
+PREPROCESSING_MANIFEST_SCHEMA_VERSION = 4
+CONDITIONING_SCHEMA_VERSION = 1
 DEFAULT_MAX_SEQUENCE_LENGTH = 512
 SPLITS = ("train", "validation", "test")
 TECHNIQUE_TYPES = (
@@ -65,6 +67,7 @@ class _Sequence:
     split: str
     ids: tuple[int, ...]
     technique_coverage: str
+    tonality: Tonality
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +84,8 @@ class _Corpus:
     eos_token_id: int
     duration_token_ids: frozenset[int]
     technique_token_ids: frozenset[int]
+    tonic_token_ids: frozenset[int]
+    mode_token_ids: frozenset[int]
     token_type_by_id: tuple[str, ...]
     sequences: tuple[_Sequence, ...]
 
@@ -164,6 +169,7 @@ class TokenizedSequenceDataset:
             "length": len(input_ids),
             "sequence_id": sequence.sequence_id,
             "split": sequence.split,
+            "tonality": sequence.tonality.as_dict(),
         }
 
     @property
@@ -219,6 +225,18 @@ class TokenizedSequenceDataset:
         """Immutable IDs excluded from base-only technique-unknown softmaxes."""
 
         return self._corpus.technique_token_ids
+
+    @property
+    def tonic_token_ids(self) -> frozenset[int]:
+        """Immutable IDs used by the fixed tonic prefix position."""
+
+        return self._corpus.tonic_token_ids
+
+    @property
+    def mode_token_ids(self) -> frozenset[int]:
+        """Immutable IDs used by the fixed mode prefix position."""
+
+        return self._corpus.mode_token_ids
 
     @property
     def token_type_by_id(self) -> tuple[str, ...]:
@@ -451,6 +469,8 @@ def _load_corpus(
         technique_token_ids=frozenset(
             tokenizer_info["technique_token_ids"].values()
         ),
+        tonic_token_ids=frozenset(tokenizer_info["tonic_token_ids"].values()),
+        mode_token_ids=frozenset(tokenizer_info["mode_token_ids"].values()),
         token_type_by_id=tokenizer_info["token_type_by_id"],
         sequences=sequences,
     )
@@ -523,12 +543,15 @@ def _validate_tokenizer(
         "vocabulary_size",
         "special_token_ids",
         "technique_token_ids",
+        "conditioning_schema_version",
+        "tonic_token_ids",
+        "mode_token_ids",
         "pitch_bend_sensitivity_semitones",
     }
     _require_exact_keys(tokenizer, required, "tokenizer")
-    if tokenizer["type"] != "GuitarREMI":
+    if tokenizer["type"] != "ConditionedGuitarREMI":
         raise DatasetContractError(
-            "Stage 3 requires tokenizer.type 'GuitarREMI'."
+            "Stage 3 requires tokenizer.type 'ConditionedGuitarREMI'."
         )
     tokenizer_path = _resolve_declared_path(tokenizer["path"], root, "tokenizer.path")
     if tokenizer_path != run_dir / "tokenizer.json":
@@ -554,9 +577,35 @@ def _validate_tokenizer(
     technique_token_ids = _normalize_technique_token_ids(
         tokenizer["technique_token_ids"], "tokenizer.technique_token_ids"
     )
-    if set(technique_token_ids.values()).intersection({pad, bos, eos}):
+    conditioning_schema = _require_positive_int(
+        tokenizer["conditioning_schema_version"],
+        "tokenizer.conditioning_schema_version",
+    )
+    if conditioning_schema != CONDITIONING_SCHEMA_VERSION:
         raise DatasetContractError(
-            "Technique token IDs must be distinct from PAD, BOS, and EOS."
+            "tokenizer.conditioning_schema_version must be "
+            f"{CONDITIONING_SCHEMA_VERSION}."
+        )
+    tonic_token_ids = _normalize_condition_token_ids(
+        tokenizer["tonic_token_ids"], "tokenizer.tonic_token_ids", TONIC_NAMES
+    )
+    mode_token_ids = _normalize_condition_token_ids(
+        tokenizer["mode_token_ids"], "tokenizer.mode_token_ids", MODE_NAMES
+    )
+    language_ids = {
+        *technique_token_ids.values(),
+        *tonic_token_ids.values(),
+        *mode_token_ids.values(),
+    }
+    if len(language_ids) != (
+        len(technique_token_ids) + len(tonic_token_ids) + len(mode_token_ids)
+    ):
+        raise DatasetContractError(
+            "Technique, tonic, and mode token IDs must be mutually distinct."
+        )
+    if language_ids.intersection({pad, bos, eos}):
+        raise DatasetContractError(
+            "Technique and conditioning IDs must be distinct from PAD, BOS, and EOS."
         )
     pitch_bend_sensitivity = _require_positive_int(
         tokenizer["pitch_bend_sensitivity_semitones"],
@@ -575,9 +624,9 @@ def _validate_tokenizer(
     ):
         raise DatasetContractError("Tokenizer hash or size does not match the manifest.")
     embedded = tokenizer_file.json
-    if embedded.get("tokenization") != "GuitarREMI":
+    if embedded.get("tokenization") != "ConditionedGuitarREMI":
         raise DatasetContractError(
-            "tokenizer.json does not describe a GuitarREMI tokenizer."
+            "tokenizer.json does not describe a ConditionedGuitarREMI tokenizer."
         )
     if (
         embedded.get("stage") != 2
@@ -597,14 +646,18 @@ def _validate_tokenizer(
 
     try:
         from .tokenizer import (
+            get_mode_token_ids,
             get_special_token_ids,
             get_technique_token_ids,
+            get_tonic_token_ids,
             load_tokenizer,
         )
 
         restored = load_tokenizer(tokenizer_path)
         actual_special = get_special_token_ids(restored)
         actual_technique_ids = get_technique_token_ids(restored)
+        actual_tonic_ids = get_tonic_token_ids(restored)
+        actual_mode_ids = get_mode_token_ids(restored)
         actual_vocabulary = restored.vocab
     except Exception as exc:
         raise DatasetContractError(f"Could not validate tokenizer.json: {exc}") from exc
@@ -619,6 +672,14 @@ def _validate_tokenizer(
     if actual_technique_ids != technique_token_ids:
         raise DatasetContractError(
             "Tokenizer technique-token IDs do not match the manifest."
+        )
+    if actual_tonic_ids != tonic_token_ids:
+        raise DatasetContractError(
+            "Tokenizer tonic-token IDs do not match the manifest."
+        )
+    if actual_mode_ids != mode_token_ids:
+        raise DatasetContractError(
+            "Tokenizer mode-token IDs do not match the manifest."
         )
     actual_pitch_bend_sensitivity = getattr(
         restored, "pitch_bend_sensitivity_semitones", None
@@ -686,6 +747,8 @@ def _validate_tokenizer(
         "bos": bos,
         "eos": eos,
         "technique_token_ids": technique_token_ids,
+        "tonic_token_ids": tonic_token_ids,
+        "mode_token_ids": mode_token_ids,
         "pitch_bend_ids": pitch_bend_ids,
         "duration_token_ids": duration_token_ids,
         "token_type_by_id": token_type_by_id,
@@ -706,6 +769,22 @@ def _normalize_technique_token_ids(value: object, name: str) -> dict[str, int]:
     return normalized
 
 
+def _normalize_condition_token_ids(
+    value: object, name: str, expected_names: Sequence[str]
+) -> dict[str, int]:
+    mapping = _require_mapping(value, name)
+    _require_exact_keys(mapping, set(expected_names), name)
+    normalized = {
+        condition_name: _require_nonnegative_int(
+            mapping[condition_name], f"{name}.{condition_name}"
+        )
+        for condition_name in expected_names
+    }
+    if len(set(normalized.values())) != len(expected_names):
+        raise DatasetContractError(f"{name} IDs must be distinct.")
+    return normalized
+
+
 def _require_technique_coverage(value: object, name: str) -> str:
     coverage = _require_string(value, name)
     if coverage not in TECHNIQUE_COVERAGE:
@@ -713,6 +792,33 @@ def _require_technique_coverage(value: object, name: str) -> str:
             f"{name} must be one of {', '.join(TECHNIQUE_COVERAGE)}."
         )
     return coverage
+
+
+def _require_tonality(value: object, name: str) -> Tonality:
+    mapping = _require_mapping(value, name)
+    required = {
+        "tonic",
+        "mode",
+        "method",
+        "tonic_confidence",
+        "mode_confidence",
+    }
+    _require_exact_keys(mapping, required, name)
+    try:
+        tonality = Tonality(
+            tonic=mapping["tonic"],
+            mode=mapping["mode"],
+            method=mapping["method"],
+            tonic_confidence=mapping["tonic_confidence"],
+            mode_confidence=mapping["mode_confidence"],
+        )
+    except (TonalityError, TypeError, ValueError) as exc:
+        raise DatasetContractError(f"Invalid {name}: {exc}") from exc
+    if tonality.as_dict() != dict(mapping):
+        raise DatasetContractError(
+            f"{name} must already use canonical tonality values."
+        )
+    return tonality
 
 
 def _normalize_techniques(
@@ -839,6 +945,7 @@ def _validate_sequences(
         "techniques",
         "track_number",
         "transpose_semitones",
+        "tonality",
     }
     sequences: list[_Sequence] = []
     records: list[Mapping[str, Any]] = []
@@ -931,6 +1038,7 @@ def _validate_sequences(
                 "programs",
                 "technique_coverage",
                 "techniques",
+                "tonality",
             },
             f"sequence '{sequence_id}'",
         )
@@ -985,10 +1093,22 @@ def _validate_sequences(
             raise DatasetContractError(
                 f"Sequence '{sequence_id}' techniques do not match its record."
             )
-        ids = _normalize_ids(sequence_payload["ids"], f"sequence '{sequence_id}'.ids")
-        if len(ids) < 3:
+        record_tonality = _require_tonality(
+            record["tonality"], f"{name}.tonality"
+        )
+        payload_tonality = _require_tonality(
+            sequence_payload["tonality"],
+            f"sequence '{sequence_id}'.tonality",
+        )
+        if payload_tonality != record_tonality:
             raise DatasetContractError(
-                f"Sequence '{sequence_id}' must contain BOS, musical content, and EOS."
+                f"Sequence '{sequence_id}' tonality does not match its record."
+            )
+        ids = _normalize_ids(sequence_payload["ids"], f"sequence '{sequence_id}'.ids")
+        if len(ids) < 5:
+            raise DatasetContractError(
+                f"Sequence '{sequence_id}' must contain BOS, Tonic, Mode, "
+                "REMI content, and EOS."
             )
         pad = tokenizer_info["pad"]
         bos = tokenizer_info["bos"]
@@ -1011,6 +1131,25 @@ def _validate_sequences(
                 f"Sequence '{sequence_id}' contains IDs outside the tokenizer vocabulary: "
                 + ", ".join(str(token_id) for token_id in unknown)
                 + "."
+            )
+        tonic_token_ids = tokenizer_info["tonic_token_ids"]
+        mode_token_ids = tokenizer_info["mode_token_ids"]
+        tonic_id_values = frozenset(tonic_token_ids.values())
+        mode_id_values = frozenset(mode_token_ids.values())
+        if (
+            ids[1] != tonic_token_ids[record_tonality.tonic]
+            or ids[2] != mode_token_ids[record_tonality.mode]
+            or sum(token_id in tonic_id_values for token_id in ids) != 1
+            or sum(token_id in mode_id_values for token_id in ids) != 1
+        ):
+            raise DatasetContractError(
+                f"Sequence '{sequence_id}' must contain exactly its declared "
+                "Tonic and Mode tokens at the fixed prefix positions."
+            )
+        if tokenizer_info["token_type_by_id"][ids[3]] != "Bar":
+            raise DatasetContractError(
+                f"Sequence '{sequence_id}' must begin REMI content with Bar "
+                "immediately after Mode."
             )
         technique_token_ids = tokenizer_info["technique_token_ids"]
         technique_id_values = frozenset(technique_token_ids.values())
@@ -1084,6 +1223,7 @@ def _validate_sequences(
                 split=split,
                 ids=ids,
                 technique_coverage=record_coverage,
+                tonality=record_tonality,
             )
         )
         records.append(record)
@@ -1108,6 +1248,7 @@ def _validate_summary(value: object, records: Sequence[Mapping[str, Any]]) -> No
             "by_split",
             "techniques",
             "pitch_bends",
+            "tonality",
         },
         "summary",
     )
@@ -1245,6 +1386,29 @@ def _validate_summary(value: object, records: Sequence[Mapping[str, Any]]) -> No
         raise DatasetContractError(
             "summary.pitch_bends does not match sequences."
         )
+
+    tonality = _require_mapping(summary["tonality"], "summary.tonality")
+    _require_exact_keys(
+        tonality, {"by_tonic", "by_mode", "by_method"}, "summary.tonality"
+    )
+    for field, names, record_key in (
+        ("by_tonic", TONIC_NAMES, "tonic"),
+        ("by_mode", MODE_NAMES, "mode"),
+        ("by_method", TONALITY_METHODS, "method"),
+    ):
+        counts = _require_mapping(
+            tonality[field], f"summary.tonality.{field}"
+        )
+        _require_exact_keys(counts, set(names), f"summary.tonality.{field}")
+        expected = Counter(record["tonality"][record_key] for record in records)
+        for label in names:
+            actual = _require_nonnegative_int(
+                counts[label], f"summary.tonality.{field}.{label}"
+            )
+            if actual != expected[label]:
+                raise DatasetContractError(
+                    f"summary.tonality.{field}.{label} does not match sequences."
+                )
 
 
 def _resolve_project_root(manifest_path: Path, project_root: str | Path | None) -> Path:

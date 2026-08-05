@@ -24,6 +24,7 @@ def _valid_payload() -> dict[str, Any]:
         "track_selection": {},
         "preprocessing": {},
         "augmentation": {},
+        "tonality": {},
         "splits": {},
     }
 
@@ -73,6 +74,7 @@ def test_load_config_resolves_relative_paths_from_nearest_project_root(
     assert config.validation.canonical_pitch_bend_range_semitones == 6
     assert config.validation.require_explicit_pitch_bend_range is True
     assert config.preprocessing.phrase_bars == 4
+    assert config.tonality.missing_sidecar_policy == "infer_source"
     assert config.splits.train == pytest.approx(0.8)
 
 
@@ -108,6 +110,11 @@ def test_load_config_resolves_relative_paths_from_nearest_project_root(
         ("preprocessing.subdivisions_per_beat", 0, "must be positive"),
         ("augmentation.apply_to_splits", [], "must contain train"),
         ("augmentation.min_semitones", 7, "cannot exceed max_semitones"),
+        (
+            "tonality.missing_sidecar_policy",
+            "guess",
+            "must be 'infer_source'.*'infer_fragment'.*'unknown'",
+        ),
         ("splits.validation", 0.2, "must sum to 1.0"),
         ("paths.input_dir", "", "must be a non-empty path string"),
     ],

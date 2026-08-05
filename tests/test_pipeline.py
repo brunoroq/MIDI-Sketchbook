@@ -14,6 +14,7 @@ from midi_idea_generator.config import SplitConfig, load_preprocess_config
 from midi_idea_generator.midi_io import read_midi
 from midi_idea_generator.pipeline import run_preprocessing
 from midi_idea_generator.techniques import TechniqueSidecarError
+from midi_idea_generator.tonality import TonalitySidecarError
 
 
 def _write_pipeline_config(project_root: Path) -> Path:
@@ -51,6 +52,7 @@ def _write_pipeline_config(project_root: Path) -> Path:
             "max_semitones": 1,
             "apply_to_splits": ["train"],
         },
+        "tonality": {"missing_sidecar_policy": "infer_source"},
         "splits": {"train": 1.0, "validation": 0.0, "test": 0.0},
     }
     config_path = project_root / "configs" / "preprocess.yaml"
@@ -60,6 +62,28 @@ def _write_pipeline_config(project_root: Path) -> Path:
         encoding="utf-8",
     )
     return config_path
+
+
+def _write_tonality_sidecar(
+    midi_path: Path,
+    *,
+    tonic: str,
+    mode: str,
+) -> Path:
+    path = midi_path.with_name(f"{midi_path.name}.tonality.json")
+    payload = {
+        "schema_version": 1,
+        "source_midi": midi_path.name,
+        "source_sha256": hashlib.sha256(midi_path.read_bytes()).hexdigest(),
+        "instrument_index": 0,
+        "tonic": tonic,
+        "mode": mode,
+    }
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def test_pipeline_continues_past_corrupt_midi_and_writes_complete_manifest(
@@ -93,7 +117,7 @@ def test_pipeline_continues_past_corrupt_midi_and_writes_complete_manifest(
         project_root / "data/splits/manifest.json"
     ).resolve()
     manifest = json.loads(report.manifest_path.read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 3
+    assert manifest["schema_version"] == 4
     assert manifest["random_seed"] == 99
     assert manifest["summary"] == {
         "compatible_sources": 1,
@@ -119,6 +143,9 @@ def test_pipeline_continues_past_corrupt_midi_and_writes_complete_manifest(
     assert valid["num_pitch_bend_events"] == 0
     assert valid["num_expressive_pitch_bend_events"] == 0
     assert valid["source_pitch_bend_range_semitones"] is None
+    assert valid["tonality"]["method"] == "AUTO_SOURCE"
+    assert valid["tonality"]["tonic"] != "UNKNOWN"
+    assert valid["tonality"]["mode"] != "UNKNOWN"
     assert valid["num_base_fragments"] == 1
     assert valid["num_fragments_generated"] == 3
     assert corrupt["compatible"] is False
@@ -141,6 +168,9 @@ def test_pipeline_continues_past_corrupt_midi_and_writes_complete_manifest(
     }
     assert {fragment["num_notes"] for fragment in fragments} == {2}
     assert {fragment["num_pitch_bend_events"] for fragment in fragments} == {0}
+    assert {fragment["tonality"]["method"] for fragment in fragments} == {
+        "AUTO_SOURCE"
+    }
     assert all(len(fragment["output_sha256"]) == 64 for fragment in fragments)
     assert all(fragment["output_size_bytes"] > 0 for fragment in fragments)
     assert all(
@@ -216,6 +246,157 @@ def test_pipeline_reuses_identical_run_and_isolates_changed_configuration(
     }
     assert current_outputs == set(third.processed_run_dir.rglob("*.mid"))
     assert all(path.is_relative_to(third.processed_run_dir) for path in current_outputs)
+
+
+def test_manual_tonality_sidecar_is_hashed_and_transposed_with_each_variant(
+    tmp_path: Path,
+    make_instrument,
+    write_midi_file,
+) -> None:
+    project_root = tmp_path / "manual-tonality-project"
+    project_root.mkdir()
+    (project_root / "pyproject.toml").write_text(
+        "[project]\nname='manual-tonality-test'\n", encoding="utf-8"
+    )
+    midi_path = write_midi_file(
+        project_root / "data/raw/riff.mid",
+        [make_instrument([(52, 0.0, 0.4), (53, 0.5, 0.9), (55, 1.0, 1.4)])],
+    )
+    sidecar_path = _write_tonality_sidecar(
+        midi_path, tonic="E", mode="PHRYGIAN"
+    )
+    config = load_preprocess_config(_write_pipeline_config(project_root))
+
+    first = run_preprocessing(config)
+    manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+    source = manifest["sources"][0]
+    by_offset = {
+        fragment["transpose_semitones"]: fragment["tonality"]
+        for fragment in manifest["fragments"]
+    }
+
+    assert source["tonality"] == {
+        "tonic": "E",
+        "mode": "PHRYGIAN",
+        "method": "MANUAL",
+        "tonic_confidence": None,
+        "mode_confidence": None,
+    }
+    assert source["tonality_sidecar"].endswith("riff.mid.tonality.json")
+    assert source["tonality_sidecar_sha256"] == hashlib.sha256(
+        sidecar_path.read_bytes()
+    ).hexdigest()
+    assert by_offset[-1]["tonic"] == "D_SHARP"
+    assert by_offset[0]["tonic"] == "E"
+    assert by_offset[1]["tonic"] == "F"
+    assert {value["mode"] for value in by_offset.values()} == {"PHRYGIAN"}
+    assert {value["method"] for value in by_offset.values()} == {"MANUAL"}
+
+    _write_tonality_sidecar(midi_path, tonic="E", mode="MINOR")
+    second = run_preprocessing(config)
+    assert second.run_id != first.run_id
+
+
+def test_infer_fragment_labels_each_untransposed_phrase_independently(
+    tmp_path: Path,
+    make_instrument,
+    write_midi_file,
+) -> None:
+    project_root = tmp_path / "fragment-tonality-project"
+    project_root.mkdir()
+    (project_root / "pyproject.toml").write_text(
+        "[project]\nname='fragment-tonality-test'\n", encoding="utf-8"
+    )
+    e_phrygian = [52, 53, 55, 57, 59, 60, 62, 64]
+    c_major = [48, 50, 52, 53, 55, 57, 59, 60]
+    notes = [
+        (pitch, index * 0.4, index * 0.4 + 0.25)
+        for index, pitch in enumerate(e_phrygian)
+    ] + [
+        (pitch, 4.0 + index * 0.4, 4.0 + index * 0.4 + 0.25)
+        for index, pitch in enumerate(c_major)
+    ]
+    write_midi_file(
+        project_root / "data/raw/two-centres.mid",
+        [make_instrument(notes)],
+    )
+    base = load_preprocess_config(_write_pipeline_config(project_root))
+    config = replace(
+        base,
+        augmentation=replace(
+            base.augmentation,
+            enabled=False,
+            min_semitones=0,
+            max_semitones=0,
+        ),
+        tonality=replace(
+            base.tonality,
+            missing_sidecar_policy="infer_fragment",
+        ),
+    )
+
+    report = run_preprocessing(config)
+    manifest = json.loads(report.manifest_path.read_text(encoding="utf-8"))
+    by_phrase = {
+        fragment["phrase_index"]: fragment["tonality"]
+        for fragment in manifest["fragments"]
+    }
+
+    assert manifest["sources"][0]["tonality"]["method"] == "AUTO_SOURCE"
+    assert by_phrase[0]["method"] == "AUTO_FRAGMENT"
+    assert by_phrase[0]["tonic"] == "E"
+    assert by_phrase[0]["mode"] == "PHRYGIAN"
+    assert by_phrase[1]["method"] == "AUTO_FRAGMENT"
+    assert by_phrase[1]["tonic"] == "C"
+    assert by_phrase[1]["mode"] == "MAJOR"
+
+
+def test_unknown_policy_emits_explicit_unknown_labels_for_all_variants(
+    tmp_path: Path,
+    make_instrument,
+    write_midi_file,
+) -> None:
+    project_root = tmp_path / "unknown-tonality-project"
+    project_root.mkdir()
+    (project_root / "pyproject.toml").write_text(
+        "[project]\nname='unknown-tonality-test'\n", encoding="utf-8"
+    )
+    write_midi_file(
+        project_root / "data/raw/riff.mid",
+        [make_instrument([(52, 0.0, 0.5), (59, 0.5, 1.0)])],
+    )
+    base = load_preprocess_config(_write_pipeline_config(project_root))
+    config = replace(
+        base,
+        tonality=replace(base.tonality, missing_sidecar_policy="unknown"),
+    )
+
+    report = run_preprocessing(config)
+    manifest = json.loads(report.manifest_path.read_text(encoding="utf-8"))
+    expected = {
+        "tonic": "UNKNOWN",
+        "mode": "UNKNOWN",
+        "method": "UNKNOWN",
+        "tonic_confidence": None,
+        "mode_confidence": None,
+    }
+    assert manifest["sources"][0]["tonality"] == expected
+    assert all(fragment["tonality"] == expected for fragment in manifest["fragments"])
+
+
+def test_pipeline_rejects_orphan_tonality_sidecar(tmp_path: Path) -> None:
+    project_root = tmp_path / "orphan-tonality-project"
+    project_root.mkdir()
+    (project_root / "pyproject.toml").write_text(
+        "[project]\nname='orphan-tonality-test'\n", encoding="utf-8"
+    )
+    raw = project_root / "data/raw"
+    raw.mkdir(parents=True)
+    (raw / "ghost.mid.tonality.json").write_text("{}\n", encoding="utf-8")
+    config = load_preprocess_config(_write_pipeline_config(project_root))
+
+    with pytest.raises(TonalitySidecarError, match="Orphan tonality sidecar"):
+        run_preprocessing(config)
 
 
 def test_pipeline_projects_complete_technique_sidecar_and_hashes_semantics(

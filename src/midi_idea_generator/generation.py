@@ -1,4 +1,4 @@
-"""Grammar-constrained unconditional sampling for the Stage 3 GRU."""
+"""Grammar-constrained symbolic sampling for the Stage 3 GRU."""
 
 from __future__ import annotations
 
@@ -21,25 +21,27 @@ from torch import Tensor
 
 from .generation_artifacts import GenerationArtifacts, write_generation_artifacts
 from .generation_checkpoint import GenerationBundle, load_generation_bundle
-from .generation_config import GenerationConfig, SamplingConfig
+from .generation_config import ConditioningConfig, GenerationConfig, SamplingConfig
 from .tokenizer import (
     DecodedMidi,
     TokenizationError,
     canonicalize_symbolic_token_ids,
+    get_mode_token_ids,
     get_technique_token_ids,
+    get_tonic_token_ids,
 )
 from .utils import relative_label, write_json
 
 
 MAX_SIMULTANEOUS_GUITAR_NOTES = 6
-_SPECIAL_TYPES = {"PAD", "BOS", "EOS"}
+_SPECIAL_TYPES = {"PAD", "BOS", "EOS", "Tonic", "Mode"}
 _TECHNIQUE_INCOMPATIBLE_WITH_DEAD = {"SLIDE_UP", "SLIDE_DOWN", "VIBRATO"}
 LOGGER = logging.getLogger(__name__)
-GENERATION_MANIFEST_SCHEMA_VERSION = 1
+GENERATION_MANIFEST_SCHEMA_VERSION = 2
 
 
 class GenerationError(RuntimeError):
-    """Raised when a requested unconditional sample cannot be produced safely."""
+    """Raised when a requested sample cannot be produced safely."""
 
 
 class _AttemptRejected(ValueError):
@@ -48,7 +50,7 @@ class _AttemptRejected(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class SampledSequence:
-    """One validated unconditional sample and its exact sampling provenance."""
+    """One validated sample and its exact sampling provenance."""
 
     sample_index: int
     sample_seed: int
@@ -102,7 +104,7 @@ class PublishedSample:
 
 @dataclass(frozen=True, slots=True)
 class GenerationReport:
-    """One atomically published unconditional-generation run."""
+    """One atomically published generation run."""
 
     generation_run_id: str
     device: str
@@ -128,6 +130,28 @@ class _VocabularyGrammar:
     ids_by_type: Mapping[str, tuple[int, ...]]
     successor_types: Mapping[str, frozenset[str]]
     technique_by_id: Mapping[int, str]
+    tonic_token_ids: Mapping[str, int]
+    mode_token_ids: Mapping[str, int]
+
+    @property
+    def supports_tonal_conditioning(self) -> bool:
+        """Return whether this vocabulary uses the two-token tonal prefix."""
+
+        return bool(self.tonic_token_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedConditioning:
+    """Vocabulary-resolved tonal prefix for one generation run."""
+
+    tonic: str
+    mode: str
+    tonic_token_id: int
+    mode_token_id: int
+
+    @property
+    def token_ids(self) -> tuple[int, int]:
+        return (self.tonic_token_id, self.mode_token_id)
 
 
 def sample_unconditional(
@@ -137,12 +161,15 @@ def sample_unconditional(
     program: int,
     sample_index: int,
     base_seed: int,
+    conditioning: ConditioningConfig | None = None,
 ) -> SampledSequence:
     """Sample one sequence from BOS with bounded retries and strict decoding.
 
-    There is no seed MIDI or musical prefix.  The fixed ``Bar / Position_0 /
-    Tempo`` preamble is format scaffolding shared by every training sequence;
-    all musical events are sampled autoregressively from the trained model.
+    New tokenizers require the configured ``Tonic / Mode`` prefix.  The prefix
+    is forced but every member is still consumed by the GRU so its recurrent
+    state is correctly primed. Legacy tokenizers remain unconditional. The
+    fixed ``Bar / Position_0 / Tempo`` preamble is format scaffolding; all note
+    events are sampled autoregressively without a scale mask.
     """
 
     if isinstance(program, bool) or not isinstance(program, int) or not 0 <= program <= 127:
@@ -157,15 +184,28 @@ def sample_unconditional(
         raise GenerationError("Generation seed must be a non-negative integer.")
 
     grammar = _build_vocabulary_grammar(bundle)
+    resolved_conditioning = _resolve_conditioning(grammar, conditioning)
     rejections: Counter[str] = Counter()
     for attempt in range(1, sampling.max_attempts_per_sample + 1):
         sample_seed = _attempt_seed(base_seed, sample_index, attempt)
         try:
-            raw_ids = _sample_attempt(bundle, grammar, sampling, sample_seed)
+            raw_ids = _sample_attempt(
+                bundle,
+                grammar,
+                sampling,
+                sample_seed,
+                resolved_conditioning,
+            )
             canonical_ids, decoded = canonicalize_symbolic_token_ids(
                 bundle.tokenizer,
                 raw_ids,
                 ((program, False),),
+            )
+            _validate_conditioned_result(
+                canonical_ids,
+                decoded,
+                grammar,
+                resolved_conditioning,
             )
             _validate_decoded_sample(decoded)
         except (TokenizationError, _AttemptRejected) as exc:
@@ -235,6 +275,7 @@ def run_generation(config: GenerationConfig) -> GenerationReport:
                 program=config.midi.program,
                 sample_index=sample_index,
                 base_seed=config.seed,
+                conditioning=config.conditioning,
             )
             LOGGER.info(
                 "Generated sample %d/%d after %d attempt(s): %d tokens, %d notes",
@@ -331,6 +372,38 @@ def _build_vocabulary_grammar(bundle: GenerationBundle) -> _VocabularyGrammar:
         int(token_id): technique
         for technique, token_id in get_technique_token_ids(bundle.tokenizer).items()
     }
+    has_tonic = "Tonic" in grouped
+    has_mode = "Mode" in grouped
+    if has_tonic != has_mode:
+        raise GenerationError(
+            "Tokenizer tonal language is incomplete: Tonic and Mode must "
+            "either both exist or both be absent."
+        )
+    tonic_token_ids: dict[str, int] = {}
+    mode_token_ids: dict[str, int] = {}
+    if has_tonic:
+        tonic_token_ids = {
+            name: int(token_id)
+            for name, token_id in get_tonic_token_ids(bundle.tokenizer).items()
+        }
+        mode_token_ids = {
+            name: int(token_id)
+            for name, token_id in get_mode_token_ids(bundle.tokenizer).items()
+        }
+        if set(tonic_token_ids.values()) != set(grouped["Tonic"]):
+            raise GenerationError(
+                "Tokenizer Tonic metadata does not match its vocabulary."
+            )
+        if set(mode_token_ids.values()) != set(grouped["Mode"]):
+            raise GenerationError(
+                "Tokenizer Mode metadata does not match its vocabulary."
+            )
+        if "Mode" not in successor_types.get("Tonic", frozenset()):
+            raise GenerationError(
+                "Tokenizer grammar must allow Tonic followed by Mode."
+            )
+        if "Bar" not in successor_types.get("Mode", frozenset()):
+            raise GenerationError("Tokenizer grammar must allow Mode followed by Bar.")
     required = {"Bar", "Position", "Tempo", "Pitch", "Duration"}
     missing = sorted(required - set(grouped))
     if missing:
@@ -351,7 +424,85 @@ def _build_vocabulary_grammar(bundle: GenerationBundle) -> _VocabularyGrammar:
         ids_by_type={key: tuple(value) for key, value in grouped.items()},
         successor_types=successor_types,
         technique_by_id=technique_by_id,
+        tonic_token_ids=tonic_token_ids,
+        mode_token_ids=mode_token_ids,
     )
+
+
+def _resolve_conditioning(
+    grammar: _VocabularyGrammar,
+    conditioning: ConditioningConfig | None,
+) -> _ResolvedConditioning | None:
+    """Bind a normalized config to this tokenizer, with legacy compatibility."""
+
+    if not grammar.supports_tonal_conditioning:
+        if conditioning is not None:
+            raise GenerationError(
+                "The selected checkpoint uses a legacy tokenizer without Tonic / "
+                "Mode conditioning; remove the conditioning section or train a "
+                "tonality-aware checkpoint."
+            )
+        return None
+    if conditioning is None:
+        raise GenerationError(
+            "The selected checkpoint requires a conditioning section with tonic "
+            "and mode."
+        )
+    tonic_token_id = grammar.tonic_token_ids.get(conditioning.tonic)
+    mode_token_id = grammar.mode_token_ids.get(conditioning.mode)
+    if tonic_token_id is None:
+        raise GenerationError(
+            f"Tokenizer does not define requested tonic {conditioning.tonic!r}."
+        )
+    if mode_token_id is None:
+        raise GenerationError(
+            f"Tokenizer does not define requested mode {conditioning.mode!r}."
+        )
+    return _ResolvedConditioning(
+        tonic=conditioning.tonic,
+        mode=conditioning.mode,
+        tonic_token_id=tonic_token_id,
+        mode_token_id=mode_token_id,
+    )
+
+
+def _validate_conditioned_result(
+    token_ids: Sequence[int],
+    decoded: DecodedMidi,
+    grammar: _VocabularyGrammar,
+    conditioning: _ResolvedConditioning | None,
+) -> None:
+    """Ensure canonicalization retained the exact forced prefix and semantics."""
+
+    if conditioning is None:
+        if any(
+            grammar.type_by_id[token_id] in {"Tonic", "Mode"}
+            for token_id in token_ids
+        ):
+            raise GenerationError(
+                "Legacy generation unexpectedly produced tonal-prefix tokens."
+            )
+        return
+    expected_prefix = (
+        grammar.bos_token_id,
+        conditioning.tonic_token_id,
+        conditioning.mode_token_id,
+    )
+    if tuple(token_ids[:3]) != expected_prefix:
+        raise GenerationError(
+            "Canonicalization did not preserve the requested Tonic / Mode prefix."
+        )
+    if any(
+        grammar.type_by_id[token_id] in {"Tonic", "Mode"}
+        for token_id in token_ids[3:]
+    ):
+        raise GenerationError(
+            "Canonical generation contains Tonic or Mode outside its prefix."
+        )
+    if decoded.tonic != conditioning.tonic or decoded.mode != conditioning.mode:
+        raise GenerationError(
+            "Decoded tonality does not match the requested conditioning."
+        )
 
 
 def _sample_attempt(
@@ -359,8 +510,10 @@ def _sample_attempt(
     grammar: _VocabularyGrammar,
     sampling: SamplingConfig,
     sample_seed: int,
+    conditioning: _ResolvedConditioning | None,
 ) -> tuple[int, ...]:
-    if sampling.max_tokens < 7:
+    prefix_ids = conditioning.token_ids if conditioning is not None else ()
+    if sampling.max_tokens < 7 + len(prefix_ids):
         raise _AttemptRejected("max_tokens is too small for a complete REMI phrase")
 
     ids = [grammar.bos_token_id]
@@ -372,25 +525,43 @@ def _sample_attempt(
     model.eval()
 
     with torch.inference_mode():
-        while len(ids) < sampling.max_tokens:
-            input_ids = torch.tensor(
-                [[ids[-1]]], dtype=torch.long, device=bundle.device
+        # A condition is a forced prompt, not a post-hoc label. Consume each
+        # previous token before appending the next forced token so the hidden
+        # state represents BOS, Tonic and Mode in their training-time order.
+        for forced_id in prefix_ids:
+            _unused_logits, hidden = _model_step(
+                model,
+                ids[-1],
+                hidden,
+                bundle=bundle,
+                grammar=grammar,
             )
-            output = model(input_ids, hidden, return_hidden=True)
-            if not isinstance(output, tuple) or len(output) != 2:
-                raise GenerationError("GRU did not return logits and recurrent state.")
-            logits, hidden = output
-            if logits.shape != (1, 1, grammar.vocabulary_size):
-                raise GenerationError("GRU returned logits with an invalid shape.")
-            next_logits = logits[0, -1].float()
-            if not torch.isfinite(next_logits).all():
-                raise GenerationError("GRU returned non-finite generation logits.")
+            ids.append(forced_id)
 
-            forced_type = _closure_type(ids, grammar, sampling)
+        while len(ids) < sampling.max_tokens:
+            next_logits, hidden = _model_step(
+                model,
+                ids[-1],
+                hidden,
+                bundle=bundle,
+                grammar=grammar,
+            )
+
+            forced_type = _closure_type(
+                ids,
+                grammar,
+                sampling,
+                conditioning_prefix_length=len(prefix_ids),
+            )
             if forced_type == "EOS":
                 ids.append(grammar.eos_token_id)
                 break
-            allowed = _allowed_token_ids(ids, grammar, sampling)
+            allowed = _allowed_token_ids(
+                ids,
+                grammar,
+                sampling,
+                conditioning_prefix_length=len(prefix_ids),
+            )
             if forced_type is not None:
                 allowed = tuple(
                     token_id
@@ -417,12 +588,41 @@ def _sample_attempt(
     return tuple(ids)
 
 
+def _model_step(
+    model: object,
+    previous_token_id: int,
+    hidden: Tensor | None,
+    *,
+    bundle: GenerationBundle,
+    grammar: _VocabularyGrammar,
+) -> tuple[Tensor, Tensor]:
+    """Consume one token and validate the recurrent inference contract."""
+
+    input_ids = torch.tensor(
+        [[previous_token_id]], dtype=torch.long, device=bundle.device
+    )
+    output = model(input_ids, hidden, return_hidden=True)  # type: ignore[operator]
+    if not isinstance(output, tuple) or len(output) != 2:
+        raise GenerationError("GRU did not return logits and recurrent state.")
+    logits, next_hidden = output
+    if not isinstance(logits, Tensor) or not isinstance(next_hidden, Tensor):
+        raise GenerationError("GRU returned invalid inference tensors.")
+    if logits.shape != (1, 1, grammar.vocabulary_size):
+        raise GenerationError("GRU returned logits with an invalid shape.")
+    next_logits = logits[0, -1].float()
+    if not torch.isfinite(next_logits).all():
+        raise GenerationError("GRU returned non-finite generation logits.")
+    return next_logits, next_hidden
+
+
 def _allowed_token_ids(
     ids: Sequence[int],
     grammar: _VocabularyGrammar,
     sampling: SamplingConfig,
+    *,
+    conditioning_prefix_length: int = 0,
 ) -> tuple[int, ...]:
-    musical_ids = ids[1:]
+    musical_ids = ids[1 + conditioning_prefix_length :]
     if not musical_ids:
         return grammar.ids_by_type["Bar"]
     if len(musical_ids) == 1:
@@ -471,7 +671,7 @@ def _allowed_token_ids(
         filtered.append(token_id)
 
     if (
-        len(musical_ids) >= sampling.min_tokens
+        len(ids) - 1 >= sampling.min_tokens
         and previous_type == "Bar"
         and len(ids) < sampling.max_tokens
     ):
@@ -483,8 +683,12 @@ def _closure_type(
     ids: Sequence[int],
     grammar: _VocabularyGrammar,
     sampling: SamplingConfig,
+    *,
+    conditioning_prefix_length: int = 0,
 ) -> str | None:
     previous_type = grammar.type_by_id[ids[-1]]
+    if len(ids) - 1 - conditioning_prefix_length == 0:
+        return None
     musical_count = len(ids) - 1
     if musical_count < sampling.min_tokens:
         return None
@@ -724,6 +928,7 @@ def _generation_run_id(
         "checkpoint_sha256": bundle.checkpoint_sha256,
         "tokenizer_sha256": bundle.tokenizer_sha256,
         "seed": config.seed,
+        "conditioning": _conditioning_payload(config.conditioning),
         "sampling": asdict(config.generation),
         "program": config.midi.program,
     }
@@ -745,7 +950,7 @@ def _sample_provenance(
     run_id: str,
 ) -> dict[str, object]:
     return {
-        "generation_mode": "unconditional",
+        "generation_mode": _generation_mode(config.conditioning),
         "generation_run_id": run_id,
         "sample_index": sample.sample_index,
         "base_seed": config.seed,
@@ -753,6 +958,7 @@ def _sample_provenance(
         "attempts_used": sample.attempts_used,
         "raw_num_tokens": len(sample.raw_token_ids),
         "canonicalized": sample.raw_token_ids != sample.token_ids,
+        "conditioning": _conditioning_payload(config.conditioning),
         "checkpoint": {
             "file": relative_label(bundle.checkpoint_path, config.project_root),
             "sha256": bundle.checkpoint_sha256,
@@ -825,7 +1031,7 @@ def _generation_manifest(
     return {
         "schema_version": GENERATION_MANIFEST_SCHEMA_VERSION,
         "generation_run_id": run_id,
-        "generation_mode": "unconditional",
+        "generation_mode": _generation_mode(config.conditioning),
         "created_at_utc": created_at.isoformat(),
         "device": str(bundle.device),
         "checkpoint": {
@@ -850,6 +1056,7 @@ def _generation_manifest(
         },
         "configuration": {
             "seed": config.seed,
+            "conditioning": _conditioning_payload(config.conditioning),
             "sampling": asdict(config.generation),
             "midi": asdict(config.midi),
             "visualization": asdict(config.visualization),
@@ -865,6 +1072,23 @@ def _generation_manifest(
             ),
         },
         "samples": [dict(sample) for sample in samples],
+    }
+
+
+def _generation_mode(conditioning: ConditioningConfig | None) -> str:
+    return "tonality_conditioned" if conditioning is not None else "unconditional"
+
+
+def _conditioning_payload(
+    conditioning: ConditioningConfig | None,
+) -> dict[str, str] | None:
+    if conditioning is None:
+        return None
+    return {
+        "tonic": conditioning.tonic,
+        "mode": conditioning.mode,
+        "tonic_token": f"Tonic_{conditioning.tonic}",
+        "mode_token": f"Mode_{conditioning.mode}",
     }
 
 

@@ -26,6 +26,7 @@ from .tokenization_config import (
     PITCH_BEND_SENSITIVITY_SEMITONES,
     RemiTokenizerConfig,
 )
+from .tonality import MODE_NAMES, TONIC_NAMES, normalize_mode, normalize_tonic
 
 
 TECHNIQUE_TYPES: tuple[str, ...] = (
@@ -47,6 +48,9 @@ _TECHNIQUE_ORDER = {
     technique_type: index for index, technique_type in enumerate(TECHNIQUE_TYPES)
 }
 _TECHNIQUE_SCHEMA_VERSION = 1
+CONDITIONING_SCHEMA_VERSION = 1
+TONIC_TOKENS: tuple[str, ...] = tuple(f"Tonic_{name}" for name in TONIC_NAMES)
+MODE_TOKENS: tuple[str, ...] = tuple(f"Mode_{name}" for name in MODE_NAMES)
 
 
 class TokenizationError(ValueError):
@@ -73,6 +77,28 @@ class GuitarREMI(REMI):
         return graph
 
 
+class ConditionedGuitarREMI(GuitarREMI):
+    """Guitar REMI whose stored streams begin with tonic and mode tokens.
+
+    The legacy :class:`GuitarREMI` class intentionally remains unchanged so
+    tokenizer JSON files belonging to older checkpoints can still recreate
+    their original vocabulary.  The two conditioning events are a wrapper
+    protocol: they are stripped before MidiTok validates or decodes REMI.
+    """
+
+    def _create_base_vocabulary(self) -> list[str]:
+        vocabulary = super()._create_base_vocabulary()
+        vocabulary.extend(TONIC_TOKENS)
+        vocabulary.extend(MODE_TOKENS)
+        return vocabulary
+
+    def _create_token_types_graph(self) -> dict[str, set[str]]:
+        graph = super()._create_token_types_graph()
+        graph["Tonic"] = {"Mode"}
+        graph["Mode"] = {"Bar"}
+        return graph
+
+
 @dataclass(frozen=True, slots=True)
 class SpecialTokenIds:
     """Vocabulary-resolved identifiers for the three Stage 2 specials."""
@@ -96,6 +122,8 @@ class DecodedMidi:
 
     score: Score
     techniques: tuple[TechniqueAnnotation, ...]
+    tonic: str
+    mode: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +136,8 @@ class EncodedMidi:
     num_notes: int
     num_pitch_bends: int
     techniques: tuple[TechniqueAnnotation, ...]
+    tonic: str
+    mode: str
     token_error_ratio: float
     round_trip_ok: bool
 
@@ -124,7 +154,7 @@ class EncodedMidi:
         return len(self.musical_ids)
 
 
-def build_tokenizer(config: RemiTokenizerConfig) -> GuitarREMI:
+def build_tokenizer(config: RemiTokenizerConfig) -> ConditionedGuitarREMI:
     """Build the deterministic, single-track REMI vocabulary for Stage 2.
 
     MidiTok 3.0.6.post1 builds pitch tokens for both configured endpoints, so
@@ -183,7 +213,7 @@ def build_tokenizer(config: RemiTokenizerConfig) -> GuitarREMI:
         use_bar_end_tokens=False,
     )
     try:
-        tokenizer = GuitarREMI(
+        tokenizer = ConditionedGuitarREMI(
             tokenizer_config=tokenizer_config,
             max_bar_embedding=config.max_bar_embedding,
         )
@@ -200,7 +230,11 @@ def build_tokenizer(config: RemiTokenizerConfig) -> GuitarREMI:
     tokenizer.pitch_bend_sensitivity_semitones = (
         config.pitch_bend_sensitivity_semitones
     )
+    tokenizer.conditioning_schema_version = CONDITIONING_SCHEMA_VERSION
+    tokenizer.tonic_names = list(TONIC_NAMES)
+    tokenizer.mode_names = list(MODE_NAMES)
     _validate_guitar_tokenizer(tokenizer)
+    _validate_conditioned_tokenizer(tokenizer)
     return tokenizer
 
 
@@ -243,11 +277,44 @@ def get_technique_token_ids(tokenizer: REMI) -> dict[str, int]:
     return resolved
 
 
+def get_tonic_token_ids(tokenizer: REMI) -> dict[str, int]:
+    """Resolve canonical tonic names to conditioned-vocabulary IDs."""
+
+    return _get_condition_token_ids(tokenizer, "Tonic", TONIC_NAMES)
+
+
+def get_mode_token_ids(tokenizer: REMI) -> dict[str, int]:
+    """Resolve canonical mode names to conditioned-vocabulary IDs."""
+
+    return _get_condition_token_ids(tokenizer, "Mode", MODE_NAMES)
+
+
+def _get_condition_token_ids(
+    tokenizer: REMI, token_type: str, names: Sequence[str]
+) -> dict[str, int]:
+    vocabulary = _vocabulary(tokenizer)
+    resolved: dict[str, int] = {}
+    for name in names:
+        token = f"{token_type}_{name}"
+        token_id = vocabulary.get(token)
+        if isinstance(token_id, bool) or not isinstance(token_id, Integral):
+            raise TokenizationError(
+                f"The tokenizer vocabulary does not define {token_type.lower()} "
+                f"token '{token}'."
+            )
+        resolved[name] = int(token_id)
+    if len(set(resolved.values())) != len(resolved):
+        raise TokenizationError(f"{token_type} tokens must have distinct IDs.")
+    return resolved
+
+
 def encode_midi(
     tokenizer: REMI,
     path: str | Path,
     *,
     techniques: Sequence[TechniqueAnnotation | Mapping[str, object]] = (),
+    tonic: str = "UNKNOWN",
+    mode: str = "UNKNOWN",
 ) -> EncodedMidi:
     """Encode one single-track MIDI plus lossless symbolic guitar techniques.
 
@@ -256,6 +323,7 @@ def encode_midi(
     immediately after the ``Duration`` belonging to their note.
     """
 
+    normalized_tonic, normalized_mode = _normalize_condition(tonic, mode)
     midi_path = Path(path).expanduser().resolve()
     if not midi_path.is_file():
         raise TokenizationError(f"MIDI file does not exist: {midi_path}")
@@ -296,7 +364,7 @@ def encode_midi(
         note_mapping,
         source=str(midi_path),
     )
-    musical_ids = _validated_musical_ids(tokenizer, sequence.ids)
+    base_musical_ids = _validated_musical_ids(tokenizer, sequence.ids)
     error_ratio = _token_error_ratio(tokenizer, sequence)
     if error_ratio != 0.0:
         raise TokenizationError(
@@ -305,6 +373,13 @@ def encode_midi(
         )
 
     special_ids = get_special_token_ids(tokenizer)
+    if isinstance(tokenizer, ConditionedGuitarREMI):
+        condition_ids = _condition_ids(
+            tokenizer, normalized_tonic, normalized_mode
+        )
+    else:
+        condition_ids = ()
+    musical_ids = (*condition_ids, *base_musical_ids)
     ids = (special_ids.bos, *musical_ids, special_ids.eos)
     if special_ids.pad in ids:
         raise TokenizationError("PAD must never be stored in an encoded MIDI.")
@@ -321,6 +396,10 @@ def encode_midi(
         raise TokenizationError(
             f"REMI round trip changed guitar techniques for '{midi_path}'."
         )
+    if (decoded.tonic, decoded.mode) != (normalized_tonic, normalized_mode):
+        raise TokenizationError(
+            f"REMI round trip changed tonal conditioning for '{midi_path}'."
+        )
 
     round_trip_sequence = _encode_score_with_techniques(
         tokenizer,
@@ -335,7 +414,7 @@ def encode_midi(
             "MidiTok reported token errors after decoding and re-encoding "
             f"'{midi_path}'."
         )
-    if round_trip_ids != musical_ids:
+    if round_trip_ids != base_musical_ids:
         raise TokenizationError(
             f"REMI content IDs are not idempotent for '{midi_path}'."
         )
@@ -347,6 +426,8 @@ def encode_midi(
         num_notes=len(note_pitches),
         num_pitch_bends=len(decoded_track.pitch_bends),
         techniques=normalized_techniques,
+        tonic=normalized_tonic,
+        mode=normalized_mode,
         token_error_ratio=error_ratio,
         round_trip_ok=True,
     )
@@ -359,7 +440,10 @@ def decode_symbolic_token_ids(
 ) -> DecodedMidi:
     """Decode stored IDs while retaining postfix guitar-technique annotations."""
 
-    musical_ids = _validated_stored_ids(tokenizer, token_ids)
+    stored_musical_ids = _validated_stored_ids(tokenizer, token_ids)
+    tonic, mode, musical_ids = _split_condition_prefix(
+        tokenizer, stored_musical_ids
+    )
     normalized_programs = _normalize_programs(programs)
     sequence = TokSequence(ids=list(musical_ids))
     try:
@@ -397,7 +481,12 @@ def decode_symbolic_token_ids(
     techniques = _extract_postfix_techniques(
         tokens, base_sequence, track, source="decoded token sequence"
     )
-    return DecodedMidi(score=score, techniques=techniques)
+    return DecodedMidi(
+        score=score,
+        techniques=techniques,
+        tonic=tonic,
+        mode=mode,
+    )
 
 
 def canonicalize_symbolic_token_ids(
@@ -419,7 +508,10 @@ def canonicalize_symbolic_token_ids(
     function cannot be used to conceal malformed model output.
     """
 
-    musical_ids = _validated_stored_ids(tokenizer, token_ids)
+    stored_musical_ids = _validated_stored_ids(tokenizer, token_ids)
+    tonic, mode, musical_ids = _split_condition_prefix(
+        tokenizer, stored_musical_ids
+    )
     normalized_programs = _normalize_programs(programs)
     sequence = TokSequence(ids=list(musical_ids))
     try:
@@ -498,8 +590,14 @@ def canonicalize_symbolic_token_ids(
             "Canonical generated REMI token sequence contains invalid transitions."
         )
     special_ids = get_special_token_ids(tokenizer)
+    condition_ids = (
+        _condition_ids(tokenizer, tonic, mode)
+        if isinstance(tokenizer, ConditionedGuitarREMI)
+        else ()
+    )
     canonical_ids = (
         special_ids.bos,
+        *condition_ids,
         *canonical_musical_ids,
         special_ids.eos,
     )
@@ -562,6 +660,14 @@ def save_tokenizer(
                 PITCH_BEND_SENSITIVITY_SEMITONES
             ),
         }
+        if isinstance(tokenizer, ConditionedGuitarREMI):
+            reserved.update(
+                {
+                    "conditioning_schema_version": CONDITIONING_SCHEMA_VERSION,
+                    "tonic_names": list(TONIC_NAMES),
+                    "mode_names": list(MODE_NAMES),
+                }
+            )
         conflicts = sorted(
             key
             for key, value in reserved.items()
@@ -602,13 +708,16 @@ def load_tokenizer(path: str | Path) -> REMI:
         if not isinstance(payload, Mapping):
             raise TypeError("tokenizer JSON root is not an object")
         tokenization = payload.get("tokenization")
-        if tokenization == "GuitarREMI":
+        if tokenization == "ConditionedGuitarREMI":
+            tokenizer = ConditionedGuitarREMI(params=tokenizer_path)
+        elif tokenization == "GuitarREMI":
             tokenizer = GuitarREMI(params=tokenizer_path)
         elif tokenization == "REMI":
             tokenizer = REMI(params=tokenizer_path)
         else:
             raise ValueError(
-                "tokenization must be 'GuitarREMI' or legacy 'REMI'"
+                "tokenization must be 'ConditionedGuitarREMI', "
+                "'GuitarREMI', or legacy 'REMI'"
             )
     except Exception as exc:
         raise TokenizationError(
@@ -622,6 +731,8 @@ def load_tokenizer(path: str | Path) -> REMI:
     get_special_token_ids(tokenizer)
     if isinstance(tokenizer, GuitarREMI):
         _validate_guitar_tokenizer(tokenizer)
+    if isinstance(tokenizer, ConditionedGuitarREMI):
+        _validate_conditioned_tokenizer(tokenizer)
     return tokenizer
 
 
@@ -664,6 +775,86 @@ def _validate_guitar_tokenizer(tokenizer: GuitarREMI) -> None:
         )
     get_special_token_ids(tokenizer)
     get_technique_token_ids(tokenizer)
+
+
+def _validate_conditioned_tokenizer(tokenizer: ConditionedGuitarREMI) -> None:
+    if (
+        getattr(tokenizer, "conditioning_schema_version", None)
+        != CONDITIONING_SCHEMA_VERSION
+    ):
+        raise TokenizationError(
+            "ConditionedGuitarREMI conditioning schema metadata is missing."
+        )
+    if tuple(getattr(tokenizer, "tonic_names", ())) != TONIC_NAMES:
+        raise TokenizationError(
+            "ConditionedGuitarREMI tonic vocabulary metadata is invalid."
+        )
+    if tuple(getattr(tokenizer, "mode_names", ())) != MODE_NAMES:
+        raise TokenizationError(
+            "ConditionedGuitarREMI mode vocabulary metadata is invalid."
+        )
+    get_tonic_token_ids(tokenizer)
+    get_mode_token_ids(tokenizer)
+
+
+def _normalize_condition(tonic: object, mode: object) -> tuple[str, str]:
+    try:
+        normalized_tonic = normalize_tonic(tonic)
+        normalized_mode = normalize_mode(mode)
+    except (TypeError, ValueError) as exc:
+        raise TokenizationError(f"Invalid tonal conditioning: {exc}") from exc
+    if normalized_tonic == "UNKNOWN" and normalized_mode != "UNKNOWN":
+        raise TokenizationError(
+            "Mode must be UNKNOWN when tonic is UNKNOWN."
+        )
+    return normalized_tonic, normalized_mode
+
+
+def _condition_ids(
+    tokenizer: ConditionedGuitarREMI, tonic: str, mode: str
+) -> tuple[int, int]:
+    normalized_tonic, normalized_mode = _normalize_condition(tonic, mode)
+    return (
+        get_tonic_token_ids(tokenizer)[normalized_tonic],
+        get_mode_token_ids(tokenizer)[normalized_mode],
+    )
+
+
+def _split_condition_prefix(
+    tokenizer: REMI, musical_ids: Sequence[int]
+) -> tuple[str, str, tuple[int, ...]]:
+    ids = tuple(musical_ids)
+    if not isinstance(tokenizer, ConditionedGuitarREMI):
+        return "UNKNOWN", "UNKNOWN", ids
+
+    tonic_ids = get_tonic_token_ids(tokenizer)
+    mode_ids = get_mode_token_ids(tokenizer)
+    tonic_name_by_id = {token_id: name for name, token_id in tonic_ids.items()}
+    mode_name_by_id = {token_id: name for name, token_id in mode_ids.items()}
+    tonic_positions = [
+        index for index, token_id in enumerate(ids) if token_id in tonic_name_by_id
+    ]
+    mode_positions = [
+        index for index, token_id in enumerate(ids) if token_id in mode_name_by_id
+    ]
+    if tonic_positions != [0] or mode_positions != [1]:
+        raise TokenizationError(
+            "A conditioned sequence must contain exactly one Tonic token at "
+            "the first musical position and one Mode token immediately after it."
+        )
+    if len(ids) < 3:
+        raise TokenizationError(
+            "A conditioned sequence must contain Tonic, Mode, and REMI content."
+        )
+    vocabulary_by_id = {int(value): key for key, value in _vocabulary(tokenizer).items()}
+    first_base = vocabulary_by_id.get(ids[2], "")
+    if not first_base.startswith("Bar_"):
+        raise TokenizationError(
+            "A conditioned sequence's first REMI token after Mode must be Bar."
+        )
+    tonic = tonic_name_by_id[ids[0]]
+    mode = mode_name_by_id[ids[1]]
+    return (*_normalize_condition(tonic, mode), ids[2:])
 
 
 def _normalize_techniques(
@@ -1133,13 +1324,17 @@ def _token_error_ratio(tokenizer: REMI, sequence: TokSequence) -> float:
 
 
 __all__ = [
+    "CONDITIONING_SCHEMA_VERSION",
+    "ConditionedGuitarREMI",
     "DecodedMidi",
     "EncodedMidi",
     "GuitarREMI",
+    "MODE_TOKENS",
     "SpecialTokenIds",
     "TECHNIQUE_TOKEN_BY_TYPE",
     "TECHNIQUE_TYPES",
     "TechniqueAnnotation",
+    "TONIC_TOKENS",
     "TokenizationError",
     "build_tokenizer",
     "canonicalize_symbolic_token_ids",
@@ -1147,7 +1342,9 @@ __all__ = [
     "decode_token_ids",
     "encode_midi",
     "get_special_token_ids",
+    "get_mode_token_ids",
     "get_technique_token_ids",
+    "get_tonic_token_ids",
     "load_tokenizer",
     "save_tokenizer",
 ]

@@ -138,6 +138,9 @@ def run_training(
         verify_hashes=True,
     )
     _validate_dataset_pair(train_dataset, validation_dataset)
+    ignored_target_token_ids = (
+        train_dataset.tonic_token_ids | train_dataset.mode_token_ids
+    )
 
     loader_generator = torch.Generator(device="cpu")
     loader_generator.manual_seed(config.seed)
@@ -304,6 +307,7 @@ def run_training(
                 amp_enabled,
                 train_dataset.technique_token_ids,
                 train_dataset.token_type_by_id,
+                ignored_target_token_ids,
             )
             (
                 validation_loss,
@@ -317,6 +321,7 @@ def run_training(
                 amp_enabled,
                 train_dataset.technique_token_ids,
                 train_dataset.token_type_by_id,
+                ignored_target_token_ids,
             )
             metrics = EpochMetrics(
                 epoch=epoch,
@@ -460,13 +465,17 @@ def _train_epoch(
     amp_enabled: bool,
     technique_token_ids: Sequence[int] | frozenset[int],
     token_type_by_id: Sequence[str],
+    ignored_target_token_ids: Sequence[int] | frozenset[int] | set[int] = (),
 ) -> tuple[float, int, float, dict[str, Any]]:
     model.train()
     total_loss = 0.0
     total_tokens = 0
     gradient_norms: list[float] = []
     diagnostics = _metrics_accumulator(
-        pad_token_id, technique_token_ids, token_type_by_id
+        pad_token_id,
+        technique_token_ids,
+        token_type_by_id,
+        ignored_target_token_ids,
     )
     for batch in loader:
         input_ids, target_ids, unknown_mask = _batch_tensors(batch, device)
@@ -479,6 +488,7 @@ def _train_epoch(
                 pad_token_id,
                 unknown_technique_decision_mask=unknown_mask,
                 technique_token_ids=technique_token_ids,
+                ignored_target_token_ids=ignored_target_token_ids,
             )
             loss = loss_sum / num_tokens
         _update_metrics(diagnostics, logits, target_ids, unknown_mask)
@@ -518,12 +528,16 @@ def _evaluate_epoch(
     amp_enabled: bool,
     technique_token_ids: Sequence[int] | frozenset[int],
     token_type_by_id: Sequence[str],
+    ignored_target_token_ids: Sequence[int] | frozenset[int] | set[int] = (),
 ) -> tuple[float, int, dict[str, Any]]:
     model.eval()
     total_loss = 0.0
     total_tokens = 0
     diagnostics = _metrics_accumulator(
-        pad_token_id, technique_token_ids, token_type_by_id
+        pad_token_id,
+        technique_token_ids,
+        token_type_by_id,
+        ignored_target_token_ids,
     )
     for batch in loader:
         input_ids, target_ids, unknown_mask = _batch_tensors(batch, device)
@@ -535,6 +549,7 @@ def _evaluate_epoch(
                 pad_token_id,
                 unknown_technique_decision_mask=unknown_mask,
                 technique_token_ids=technique_token_ids,
+                ignored_target_token_ids=ignored_target_token_ids,
             )
         _update_metrics(diagnostics, logits, target_ids, unknown_mask)
         count = int(num_tokens.item())
@@ -552,12 +567,14 @@ def _metrics_accumulator(
     pad_token_id: int,
     technique_token_ids: Sequence[int] | frozenset[int],
     token_type_by_id: Sequence[str],
+    ignored_target_token_ids: Sequence[int] | frozenset[int] | set[int] = (),
 ) -> TrainingMetricsAccumulator:
     try:
         return TrainingMetricsAccumulator(
             pad_token_id,
             technique_token_ids,
             token_type_by_id,
+            ignored_target_token_ids=ignored_target_token_ids,
         )
     except TrainingMetricsError as exc:
         raise TrainingError(f"Invalid training metrics contract: {exc}") from exc
@@ -582,15 +599,18 @@ def token_cross_entropy(
     *,
     unknown_technique_decision_mask: Tensor | None = None,
     technique_token_ids: Sequence[int] | frozenset[int] = (),
+    ignored_target_token_ids: Sequence[int] | frozenset[int] | set[int] = (),
 ) -> tuple[Tensor, Tensor]:
-    """Return the partial-label objective and the real-token count.
+    """Return the partial-label objective and optimized-target count.
 
     At an ``UNLABELED`` note's post-``Duration`` decision, the base target is
     known but the presence of a guitar technique is not.  Those positions use
     a softmax over the non-technique vocabulary: the real structural target
     still trains normally, while the six ``Technique`` logits receive exactly
     zero gradient.  Fully labelled and ordinary positions use the complete
-    vocabulary.
+    vocabulary. Prompt-only targets such as ``Tonic`` and ``Mode`` can be
+    excluded from the objective without removing their input tokens from the
+    recurrent context. Their classes remain in every other softmax denominator.
     """
 
     if logits.ndim != 3 or targets.ndim != 2:
@@ -608,7 +628,19 @@ def token_cross_entropy(
         or not 0 <= pad_token_id < vocabulary_size
     ):
         raise TrainingError("pad_token_id must be inside the model vocabulary.")
+    ignored_ids = _normalize_ignored_target_ids(
+        ignored_target_token_ids,
+        vocabulary_size=vocabulary_size,
+        pad_token_id=pad_token_id,
+    )
     real_mask = targets != pad_token_id
+    ignored_mask = torch.zeros_like(targets, dtype=torch.bool)
+    if ignored_ids:
+        ignored_tensor = torch.tensor(
+            ignored_ids, dtype=torch.long, device=targets.device
+        )
+        ignored_mask = torch.isin(targets, ignored_tensor)
+    objective_mask = real_mask & ~ignored_mask
     if unknown_technique_decision_mask is None:
         unknown_mask = torch.zeros_like(targets, dtype=torch.bool)
     else:
@@ -626,6 +658,10 @@ def token_cross_entropy(
     if torch.any(unknown_mask & ~real_mask):
         raise TrainingError(
             "Unknown technique decisions cannot mark padded target positions."
+        )
+    if torch.any(unknown_mask & ignored_mask):
+        raise TrainingError(
+            "Unknown technique decisions cannot mark ignored target positions."
         )
 
     normalized_technique_ids: list[int] = []
@@ -649,11 +685,13 @@ def token_cross_entropy(
             "Unknown technique decisions require technique_token_ids."
         )
 
-    num_tokens = real_mask.sum()
+    num_tokens = objective_mask.sum()
     if int(num_tokens.item()) <= 0:
-        raise TrainingError("A training batch cannot contain only padding targets.")
+        raise TrainingError(
+            "A training batch cannot contain only padding or ignored targets."
+        )
     loss_sum = logits.sum() * 0.0
-    ordinary_mask = real_mask & ~unknown_mask
+    ordinary_mask = objective_mask & ~unknown_mask
     if torch.any(ordinary_mask):
         loss_sum = loss_sum + F.cross_entropy(
             logits[ordinary_mask],
@@ -695,6 +733,34 @@ def token_cross_entropy(
     if not torch.isfinite(loss_sum):
         raise TrainingError("Cross-entropy loss became non-finite.")
     return loss_sum, num_tokens
+
+
+def _normalize_ignored_target_ids(
+    value: Sequence[int] | frozenset[int] | set[int],
+    *,
+    vocabulary_size: int,
+    pad_token_id: int,
+) -> tuple[int, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(
+        value, (Sequence, set, frozenset)
+    ):
+        raise TrainingError("ignored_target_token_ids must be a collection of IDs.")
+    normalized: list[int] = []
+    for index, token_id in enumerate(value):
+        if (
+            isinstance(token_id, bool)
+            or not isinstance(token_id, int)
+            or not 0 <= token_id < vocabulary_size
+        ):
+            raise TrainingError(
+                f"ignored_target_token_ids[{index}] must be inside the vocabulary."
+            )
+        normalized.append(token_id)
+    if len(set(normalized)) != len(normalized):
+        raise TrainingError("ignored_target_token_ids must be distinct.")
+    if pad_token_id in normalized:
+        raise TrainingError("PAD cannot be an ignored target token ID.")
+    return tuple(sorted(normalized))
 
 
 def _batch_tensors(
@@ -748,6 +814,8 @@ def _validate_dataset_pair(
         "configuration_sha256",
         "tokenization_manifest_sha256",
         "technique_token_ids",
+        "tonic_token_ids",
+        "mode_token_ids",
         "token_type_by_id",
     )
     for attribute in attributes:

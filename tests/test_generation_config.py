@@ -17,6 +17,7 @@ def _valid_payload() -> dict[str, Any]:
     return {
         "seed": 42,
         "device": "auto",
+        "conditioning": {"tonic": "E", "mode": "PHRYGIAN"},
         "paths": {
             "checkpoint": "checkpoints/run/best.pt",
             "tokenization_manifest": "data/tokenized/manifest.json",
@@ -85,6 +86,9 @@ def test_load_generation_config_resolves_paths_and_preserves_contract(
     assert config.project_root == project_root.resolve()
     assert config.seed == 42
     assert config.device == "auto"
+    assert config.conditioning is not None
+    assert config.conditioning.tonic == "E"
+    assert config.conditioning.mode == "PHRYGIAN"
     assert config.paths.checkpoint_path == (
         project_root / "checkpoints/run/best.pt"
     ).resolve()
@@ -105,6 +109,68 @@ def test_load_generation_config_resolves_paths_and_preserves_contract(
     assert config.visualization.enabled is True
     assert config.visualization.dpi == 160
     assert not config.paths.output_dir.exists()
+
+
+def test_conditioning_is_optional_for_legacy_checkpoints(tmp_path: Path) -> None:
+    project_root = _project(tmp_path)
+    payload = _valid_payload()
+    del payload["conditioning"]
+
+    config = load_generation_config(
+        _write_config(project_root / "configs/generate.yaml", payload)
+    )
+
+    assert config.conditioning is None
+
+
+def test_conditioning_aliases_are_normalized_before_generation(tmp_path: Path) -> None:
+    project_root = _project(tmp_path)
+    payload = _valid_payload()
+    payload["conditioning"] = {"tonic": "F#", "mode": "aeolian"}
+
+    config = load_generation_config(
+        _write_config(project_root / "configs/generate.yaml", payload)
+    )
+
+    assert config.conditioning is not None
+    assert (config.conditioning.tonic, config.conditioning.mode) == (
+        "F_SHARP",
+        "MINOR",
+    )
+
+
+@pytest.mark.parametrize(
+    ("conditioning", "message"),
+    [
+        ({"mode": "PHRYGIAN"}, "Missing conditioning setting.*tonic"),
+        ({"tonic": "E"}, "Missing conditioning setting.*mode"),
+        ({"tonic": "H", "mode": "PHRYGIAN"}, "conditioning.tonic"),
+        ({"tonic": "E", "mode": "NOT_A_MODE"}, "conditioning.mode"),
+        (
+            {"tonic": "UNKNOWN", "mode": "PHRYGIAN"},
+            "mode.*UNKNOWN when tonic is UNKNOWN",
+        ),
+        ({"tonic": 4, "mode": "PHRYGIAN"}, "tonic.*non-empty string"),
+        ({"tonic": "E", "mode": False}, "mode.*non-empty string"),
+        (
+            {"tonic": "E", "mode": "PHRYGIAN", "scale_mask": True},
+            "Unknown key.*scale_mask",
+        ),
+    ],
+)
+def test_conditioning_contract_is_strict(
+    tmp_path: Path,
+    conditioning: object,
+    message: str,
+) -> None:
+    project_root = _project(tmp_path)
+    payload = _valid_payload()
+    payload["conditioning"] = conditioning
+
+    with pytest.raises(ConfigError, match=message):
+        load_generation_config(
+            _write_config(project_root / "configs/generate.yaml", payload)
+        )
 
 
 def test_sections_use_safe_documented_defaults(tmp_path: Path) -> None:

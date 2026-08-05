@@ -1,4 +1,4 @@
-"""Strict YAML configuration contract for unconditional MIDI generation.
+"""Strict YAML configuration contract for symbolic MIDI generation.
 
 The module intentionally stays independent of PyTorch and the generation
 runtime.  It validates sampling parameters and filesystem boundaries before a
@@ -15,6 +15,7 @@ from typing import Any, Mapping
 import yaml
 
 from .config import ConfigError
+from .tonality import MODE_NAMES, TONIC_NAMES, normalize_mode, normalize_tonic
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,7 +29,7 @@ class GenerationPathsConfig:
 
 @dataclass(frozen=True, slots=True)
 class SamplingConfig:
-    """Limits and probability controls for unconditional token sampling."""
+    """Limits and probability controls for autoregressive token sampling."""
 
     max_tokens: int = 256
     min_tokens: int = 32
@@ -39,6 +40,14 @@ class SamplingConfig:
     max_simultaneous_notes: int = 3
     num_samples: int = 4
     max_attempts_per_sample: int = 25
+
+
+@dataclass(frozen=True, slots=True)
+class ConditioningConfig:
+    """Normalized tonal prefix requested for one generation run."""
+
+    tonic: str
+    mode: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,12 +67,13 @@ class VisualizationConfig:
 
 @dataclass(frozen=True, slots=True)
 class GenerationConfig:
-    """Complete validated configuration for unconditional generation."""
+    """Complete validated configuration for symbolic generation."""
 
     seed: int
     device: str
     project_root: Path
     paths: GenerationPathsConfig
+    conditioning: ConditioningConfig | None
     generation: SamplingConfig
     midi: MidiConfig
     visualization: VisualizationConfig
@@ -304,6 +314,55 @@ def _load_sampling(root: Mapping[str, Any]) -> SamplingConfig:
     return config
 
 
+def _load_conditioning(
+    root: Mapping[str, Any],
+) -> ConditioningConfig | None:
+    """Load an optional prefix while preserving legacy unconditional configs."""
+
+    if "conditioning" not in root:
+        return None
+    values = _mapping(root["conditioning"], "conditioning")
+    allowed = {"tonic", "mode"}
+    _reject_unknown(values, allowed, "conditioning")
+    missing = sorted(allowed - set(values))
+    if missing:
+        raise ConfigError(
+            "Missing conditioning setting(s): " + ", ".join(missing) + "."
+        )
+
+    tonic_value = values["tonic"]
+    mode_value = values["mode"]
+    if not isinstance(tonic_value, str) or not tonic_value.strip():
+        raise ConfigError("'conditioning.tonic' must be a non-empty string.")
+    if not isinstance(mode_value, str) or not mode_value.strip():
+        raise ConfigError("'conditioning.mode' must be a non-empty string.")
+    try:
+        tonic = normalize_tonic(tonic_value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "'conditioning.tonic' must resolve to one of: "
+            + ", ".join(TONIC_NAMES)
+            + "."
+        ) from exc
+    try:
+        mode = normalize_mode(mode_value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "'conditioning.mode' must resolve to one of: "
+            + ", ".join(MODE_NAMES)
+            + "."
+        ) from exc
+    if tonic not in TONIC_NAMES:
+        raise ConfigError("Normalized conditioning tonic is outside TONIC_NAMES.")
+    if mode not in MODE_NAMES:
+        raise ConfigError("Normalized conditioning mode is outside MODE_NAMES.")
+    if tonic == "UNKNOWN" and mode != "UNKNOWN":
+        raise ConfigError(
+            "'conditioning.mode' must be UNKNOWN when tonic is UNKNOWN."
+        )
+    return ConditioningConfig(tonic=tonic, mode=mode)
+
+
 def _load_midi(root: Mapping[str, Any]) -> MidiConfig:
     values = _section(root, "midi")
     _reject_unknown(values, {"program"}, "midi")
@@ -328,7 +387,7 @@ def _load_visualization(root: Mapping[str, Any]) -> VisualizationConfig:
 
 
 def load_generation_config(path: str | Path) -> GenerationConfig:
-    """Load and validate an unconditional-generation YAML configuration.
+    """Load and validate a symbolic-generation YAML configuration.
 
     Relative paths are resolved against the nearest parent containing
     ``pyproject.toml``.  Input artifacts must already exist; the output
@@ -349,7 +408,15 @@ def load_generation_config(path: str | Path) -> GenerationConfig:
     root = _mapping(raw, "root")
     _reject_unknown(
         root,
-        {"seed", "device", "paths", "generation", "midi", "visualization"},
+        {
+            "seed",
+            "device",
+            "paths",
+            "conditioning",
+            "generation",
+            "midi",
+            "visualization",
+        },
         "root",
     )
     project_root = _project_root(config_path)
@@ -367,6 +434,7 @@ def load_generation_config(path: str | Path) -> GenerationConfig:
         device=device,
         project_root=project_root,
         paths=paths,
+        conditioning=_load_conditioning(root),
         generation=_load_sampling(root),
         midi=_load_midi(root),
         visualization=_load_visualization(root),
@@ -374,6 +442,7 @@ def load_generation_config(path: str | Path) -> GenerationConfig:
 
 
 __all__ = [
+    "ConditioningConfig",
     "GenerationConfig",
     "GenerationPathsConfig",
     "MidiConfig",

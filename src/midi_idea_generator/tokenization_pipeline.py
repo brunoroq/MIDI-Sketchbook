@@ -19,24 +19,34 @@ from .tokenization_config import (
     PITCH_BEND_SENSITIVITY_SEMITONES,
     TokenizationConfig,
 )
+from .tonality import (
+    MODE_NAMES,
+    TONALITY_METHODS,
+    TONIC_NAMES,
+    Tonality,
+    TonalityError,
+)
 from .tokenizer import (
+    CONDITIONING_SCHEMA_VERSION,
     TECHNIQUE_TYPES,
     EncodedMidi,
     TechniqueAnnotation,
     TokenizationError,
     build_tokenizer,
     encode_midi,
+    get_mode_token_ids,
     get_special_token_ids,
     get_technique_token_ids,
+    get_tonic_token_ids,
     load_tokenizer,
     save_tokenizer,
 )
 from .utils import relative_label, write_json
 
 
-TOKENIZATION_SCHEMA_VERSION = 2
-SEQUENCE_SCHEMA_VERSION = 2
-PREPROCESSING_SCHEMA_VERSION = 3
+TOKENIZATION_SCHEMA_VERSION = 3
+SEQUENCE_SCHEMA_VERSION = 3
+PREPROCESSING_SCHEMA_VERSION = 4
 _SPLITS = ("train", "validation", "test")
 _TECHNIQUE_COVERAGE = ("UNLABELED", "COMPLETE")
 _TECHNIQUE_ORDER = {
@@ -83,6 +93,7 @@ class FragmentSpec:
     techniques: tuple[TechniqueAnnotation, ...]
     nominal_duration_seconds: float
     actual_note_duration_seconds: float
+    tonality: Tonality
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +180,14 @@ def run_tokenization(config: TokenizationConfig) -> TokenizationReport:
             raise TokenizationPipelineError(
                 "Reloading tokenizer.json changed the technique-token IDs."
             )
+        if get_tonic_token_ids(restored) != get_tonic_token_ids(tokenizer):
+            raise TokenizationPipelineError(
+                "Reloading tokenizer.json changed the tonic-token IDs."
+            )
+        if get_mode_token_ids(restored) != get_mode_token_ids(tokenizer):
+            raise TokenizationPipelineError(
+                "Reloading tokenizer.json changed the mode-token IDs."
+            )
         # Encode with the reloaded artifact itself.  This makes the tokenizer
         # published for Stage 3 the exact implementation exercised here.
         tokenizer = restored
@@ -191,6 +210,8 @@ def run_tokenization(config: TokenizationConfig) -> TokenizationReport:
         tokenizer_fingerprint = _fingerprint_file(staged_tokenizer_path)
         special_ids = get_special_token_ids(tokenizer)
         technique_ids = get_technique_token_ids(tokenizer)
+        tonic_ids = get_tonic_token_ids(tokenizer)
+        mode_ids = get_mode_token_ids(tokenizer)
         manifest = {
             "schema_version": TOKENIZATION_SCHEMA_VERSION,
             "tokenization_run_id": run_id,
@@ -208,7 +229,7 @@ def run_tokenization(config: TokenizationConfig) -> TokenizationReport:
             "configuration": configuration,
             "tool_versions": tool_versions,
             "tokenizer": {
-                "type": "GuitarREMI",
+                "type": "ConditionedGuitarREMI",
                 "path": relative_label(
                     final_run_dir / "tokenizer.json", config.project_root
                 ),
@@ -222,6 +243,9 @@ def run_tokenization(config: TokenizationConfig) -> TokenizationReport:
                     "eos": special_ids.eos,
                 },
                 "technique_token_ids": technique_ids,
+                "conditioning_schema_version": CONDITIONING_SCHEMA_VERSION,
+                "tonic_token_ids": tonic_ids,
+                "mode_token_ids": mode_ids,
                 "pitch_bend_sensitivity_semitones": (
                     PITCH_BEND_SENSITIVITY_SEMITONES
                 ),
@@ -457,6 +481,7 @@ def _validate_fragment(
         "techniques",
         "nominal_duration_seconds",
         "actual_note_duration_seconds",
+        "tonality",
     }
     _reject_unknown_keys(fragment, allowed, name)
     missing = sorted(allowed - set(fragment))
@@ -565,6 +590,7 @@ def _validate_fragment(
         fragment["actual_note_duration_seconds"],
         f"{name}.actual_note_duration_seconds",
     )
+    tonality = _require_tonality(fragment["tonality"], f"{name}.tonality")
     output_file = _require_string(fragment["output_file"], f"{name}.output_file")
     output_candidate = _manifest_path_candidate(
         output_file, project_root, f"{name}.output_file"
@@ -630,6 +656,7 @@ def _validate_fragment(
         techniques=techniques,
         nominal_duration_seconds=nominal_duration,
         actual_note_duration_seconds=actual_duration,
+        tonality=tonality,
     )
 
 
@@ -652,7 +679,11 @@ def _tokenize_fragments(
                     "input changed before it was tokenized"
                 )
             encoded = encode_midi(
-                tokenizer, fragment.path, techniques=fragment.techniques
+                tokenizer,
+                fragment.path,
+                techniques=fragment.techniques,
+                tonic=fragment.tonality.tonic,
+                mode=fragment.tonality.mode,
             )
             if _fingerprint_file(fragment.path) != expected:
                 raise TokenizationPipelineError(
@@ -704,6 +735,7 @@ def _tokenize_fragments(
                     "actual_note_duration_seconds": fragment.actual_note_duration_seconds,
                     "token_error_ratio": encoded.token_error_ratio,
                     "round_trip_ok": encoded.round_trip_ok,
+                    "tonality": fragment.tonality.as_dict(),
                 }
             )
         except (OSError, TokenizationError, TokenizationPipelineError) as exc:
@@ -721,6 +753,7 @@ def _sequence_payload(
         "programs": [list(program) for program in encoded.programs],
         "technique_coverage": fragment.technique_coverage,
         "techniques": _techniques_payload(encoded.techniques),
+        "tonality": fragment.tonality.as_dict(),
     }
 
 
@@ -734,6 +767,7 @@ def _sequence_id(fragment: FragmentSpec, fingerprint: FileFingerprint) -> str:
             "sha256": fingerprint.sha256,
             "technique_coverage": fragment.technique_coverage,
             "techniques": _techniques_payload(fragment.techniques),
+            "tonality": fragment.tonality.as_dict(),
         }
     )[:12]
     return f"{slug}-{digest}"
@@ -770,6 +804,7 @@ def _implementation_sha256() -> str:
     package_dir = Path(__file__).resolve().parent
     digest = hashlib.sha256()
     for filename in (
+        "tonality.py",
         "tokenization_config.py",
         "tokenizer.py",
         "tokenization_pipeline.py",
@@ -864,6 +899,26 @@ def _summarize_sequences(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]
             "sequences_with_pitch_bends": sum(
                 int(record["num_pitch_bend_tokens"]) > 0 for record in records
             ),
+        },
+        "tonality": {
+            "by_tonic": {
+                tonic: sum(
+                    record["tonality"]["tonic"] == tonic for record in records
+                )
+                for tonic in TONIC_NAMES
+            },
+            "by_mode": {
+                mode: sum(
+                    record["tonality"]["mode"] == mode for record in records
+                )
+                for mode in MODE_NAMES
+            },
+            "by_method": {
+                method: sum(
+                    record["tonality"]["method"] == method for record in records
+                )
+                for method in TONALITY_METHODS
+            },
         },
     }
 
@@ -1040,6 +1095,38 @@ def _require_split(value: object, name: str) -> str:
             f"{name} must be train, validation, or test."
         )
     return split
+
+
+def _require_tonality(value: object, name: str) -> Tonality:
+    mapping = _require_mapping(value, name)
+    required = {
+        "tonic",
+        "mode",
+        "method",
+        "tonic_confidence",
+        "mode_confidence",
+    }
+    _reject_unknown_keys(mapping, required, name)
+    missing = sorted(required - set(mapping))
+    if missing:
+        raise TokenizationPipelineError(
+            f"Missing field(s) in {name}: {', '.join(missing)}."
+        )
+    try:
+        tonality = Tonality(
+            tonic=mapping["tonic"],
+            mode=mapping["mode"],
+            method=mapping["method"],
+            tonic_confidence=mapping["tonic_confidence"],
+            mode_confidence=mapping["mode_confidence"],
+        )
+    except (TonalityError, TypeError, ValueError) as exc:
+        raise TokenizationPipelineError(f"Invalid {name}: {exc}") from exc
+    if tonality.as_dict() != dict(mapping):
+        raise TokenizationPipelineError(
+            f"{name} must already use canonical tonality values."
+        )
+    return tonality
 
 
 def _require_technique_coverage(value: object, name: str) -> str:

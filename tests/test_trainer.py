@@ -42,12 +42,14 @@ class _SyntheticDataset:
     configuration_sha256 = "2" * 64
     tokenization_manifest_sha256 = "3" * 64
     technique_token_ids = frozenset({9, 10})
+    tonic_token_ids = frozenset({3})
+    mode_token_ids = frozenset({4})
     token_type_by_id = (
         "PAD",
         "BOS",
         "EOS",
-        "Bar",
-        "Position",
+        "Tonic",
+        "Mode",
         "Pitch",
         "Duration",
         "Pitch",
@@ -60,12 +62,12 @@ class _SyntheticDataset:
     _IDS = {
         "train": (
             (1, 3, 4, 5, 2),
-            (1, 4, 6, 2),
-            (1, 5, 7, 8, 2),
+            (1, 3, 4, 6, 2),
+            (1, 3, 4, 7, 8, 2),
         ),
         "validation": (
-            (1, 3, 6, 2),
-            (1, 5, 8, 2),
+            (1, 3, 4, 6, 2),
+            (1, 3, 4, 8, 2),
         ),
     }
 
@@ -221,6 +223,76 @@ def test_token_cross_entropy_ignores_pad_in_loss_count_and_gradient() -> None:
     assert torch.count_nonzero(logits.grad[0, 2]).item() > 0
 
 
+def test_token_cross_entropy_ignores_prompt_targets_only_at_their_steps() -> None:
+    logits = torch.tensor(
+        [
+            [
+                [0.0, 0.5, 1.0, -0.5, 0.2],
+                [0.1, 1.5, -0.5, 0.0, 0.3],
+                [-0.2, 2.0, 1.0, 0.5, 0.0],
+            ]
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    targets = torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+    loss_sum, num_tokens = token_cross_entropy(
+        logits,
+        targets,
+        pad_token_id=0,
+        ignored_target_token_ids=(1, 2),
+    )
+    expected = F.cross_entropy(
+        logits[:, 2, :], torch.tensor([3]), reduction="sum"
+    )
+    loss_sum.backward()
+
+    assert num_tokens.item() == 1
+    torch.testing.assert_close(loss_sum.detach(), expected.detach())
+    assert logits.grad is not None
+    torch.testing.assert_close(logits.grad[0, :2], torch.zeros((2, 5)))
+    # Prompt classes stay in the ordinary full-vocabulary denominator.
+    assert logits.grad[0, 2, 1].item() > 0
+    assert logits.grad[0, 2, 2].item() > 0
+    assert logits.grad[0, 2, 3].item() < 0
+
+
+@pytest.mark.parametrize(
+    ("ignored_ids", "message"),
+    [
+        ((True,), "inside the vocabulary"),
+        ((-1,), "inside the vocabulary"),
+        ((5,), "inside the vocabulary"),
+        ((1, 1), "distinct"),
+        ((0,), "PAD"),
+        ("Tonic", "collection"),
+    ],
+)
+def test_token_cross_entropy_rejects_invalid_ignored_target_ids(
+    ignored_ids: object, message: str
+) -> None:
+    with pytest.raises(TrainingError, match=message):
+        token_cross_entropy(
+            torch.zeros((1, 2, 5), dtype=torch.float32),
+            torch.tensor([[1, 2]], dtype=torch.long),
+            pad_token_id=0,
+            ignored_target_token_ids=ignored_ids,  # type: ignore[arg-type]
+        )
+
+
+def test_token_cross_entropy_rejects_unknown_mask_on_ignored_target() -> None:
+    with pytest.raises(TrainingError, match="ignored target"):
+        token_cross_entropy(
+            torch.zeros((1, 2, 5), dtype=torch.float32),
+            torch.tensor([[1, 2]], dtype=torch.long),
+            pad_token_id=0,
+            unknown_technique_decision_mask=torch.tensor([[True, False]]),
+            technique_token_ids=(3, 4),
+            ignored_target_token_ids=(1,),
+        )
+
+
 def test_partial_label_loss_trains_base_target_without_technique_gradients() -> None:
     logits = torch.tensor(
         [[[0.0, 0.5, 1.0, 4.0, 3.0, -0.5]]],
@@ -295,6 +367,19 @@ def test_token_cross_entropy_rejects_all_padding() -> None:
 
     with pytest.raises(TrainingError, match="only padding"):
         token_cross_entropy(logits, targets, pad_token_id=0)
+
+
+def test_token_cross_entropy_rejects_all_ignored_targets() -> None:
+    logits = torch.zeros((1, 2, 5), dtype=torch.float32)
+    targets = torch.tensor([[1, 2]], dtype=torch.long)
+
+    with pytest.raises(TrainingError, match="ignored targets"):
+        token_cross_entropy(
+            logits,
+            targets,
+            pad_token_id=0,
+            ignored_target_token_ids=(1, 2),
+        )
 
 
 def test_train_epoch_backpropagates_and_counts_only_real_targets() -> None:
@@ -485,6 +570,18 @@ def test_resume_matches_uninterrupted_training_exactly(
     )
     assert resumed.history[-1].validation_metrics == (
         uninterrupted.history[-1].validation_metrics
+    )
+    assert uninterrupted.history[0].train_tokens == 7
+    assert uninterrupted.history[0].validation_tokens == 4
+    assert (
+        uninterrupted.history[0].train_metrics["by_target_type"]["Tonic"]["count"]
+        == 0
+    )
+    assert (
+        uninterrupted.history[0].validation_metrics["by_target_type"]["Mode"][
+            "count"
+        ]
+        == 0
     )
 
 

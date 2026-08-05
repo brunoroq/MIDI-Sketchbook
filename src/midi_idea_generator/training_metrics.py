@@ -162,6 +162,8 @@ class TrainingMetricsAccumulator:
     technique IDs are unavailable only at positions marked by
     ``post_duration_unknown_mask``. The full-vocabulary NLL remains available
     to reveal calibration differences hidden by the partial-label objective.
+    Targets listed in ``ignored_target_token_ids`` are prompt-only context and
+    are excluded from every aggregate without changing any other denominator.
 
     ``token_type_by_id`` can be either a contiguous ``id -> type`` mapping or a
     sequence indexed by token ID. Every vocabulary ID must have one non-empty
@@ -173,6 +175,7 @@ class TrainingMetricsAccumulator:
         pad_token_id: int,
         technique_token_ids: Sequence[int] | frozenset[int] | set[int],
         token_type_by_id: Mapping[int, str] | Sequence[str],
+        ignored_target_token_ids: Sequence[int] | frozenset[int] | set[int] = (),
     ) -> None:
         self._token_type_by_id = _normalize_token_types(token_type_by_id)
         self._vocabulary_size = len(self._token_type_by_id)
@@ -186,6 +189,11 @@ class TrainingMetricsAccumulator:
             vocabulary_size=self._vocabulary_size,
             pad_token_id=self._pad_token_id,
             token_types=self._token_type_by_id,
+        )
+        self._ignored_target_token_ids = _normalize_ignored_target_ids(
+            ignored_target_token_ids,
+            vocabulary_size=self._vocabulary_size,
+            pad_token_id=self._pad_token_id,
         )
         unique_types = tuple(sorted(set(self._token_type_by_id)))
         type_to_index = {
@@ -211,6 +219,10 @@ class TrainingMetricsAccumulator:
         return self._technique_token_ids
 
     @property
+    def ignored_target_token_ids(self) -> tuple[int, ...]:
+        return self._ignored_target_token_ids
+
+    @property
     def batches(self) -> int:
         return self._batches
 
@@ -233,9 +245,10 @@ class TrainingMetricsAccumulator:
     ) -> None:
         """Add one ``(batch, time, vocabulary)`` logits batch.
 
-        PAD targets are ignored. The unknown mask must use ``torch.bool`` and
-        cannot mark padding or a technique target. Inputs are never mutated and
-        no autograd graph is retained.
+        PAD and configured prompt-only targets are ignored. The unknown mask
+        must use ``torch.bool`` and cannot mark padding, an ignored target, or a
+        technique target. Inputs are never mutated and no autograd graph is
+        retained.
         """
 
         _validate_batch_tensors(
@@ -245,18 +258,26 @@ class TrainingMetricsAccumulator:
             vocabulary_size=self._vocabulary_size,
             pad_token_id=self._pad_token_id,
             technique_token_ids=self._technique_token_ids,
+            ignored_target_token_ids=self._ignored_target_token_ids,
         )
         flat_logits = logits.detach().reshape(-1, self._vocabulary_size)
         flat_targets = targets.detach().reshape(-1)
         flat_unknown = post_duration_unknown_mask.detach().reshape(-1)
-        real = flat_targets != self._pad_token_id
-        if not bool(real.any()):
+        objective = flat_targets != self._pad_token_id
+        if self._ignored_target_token_ids:
+            ignored_ids = torch.tensor(
+                self._ignored_target_token_ids,
+                dtype=torch.long,
+                device=flat_targets.device,
+            )
+            objective &= ~torch.isin(flat_targets, ignored_ids)
+        if not bool(objective.any()):
             self._batches += 1
             return
 
-        observed_logits = flat_logits[real].float()
-        observed_targets = flat_targets[real]
-        observed_unknown = flat_unknown[real]
+        observed_logits = flat_logits[objective].float()
+        observed_targets = flat_targets[objective]
+        observed_unknown = flat_unknown[objective]
         if not torch.isfinite(observed_logits).all():
             raise TrainingMetricsError("logits contain non-finite values at real targets.")
 
@@ -391,6 +412,33 @@ def _normalize_technique_ids(
     return tuple(sorted(normalized))
 
 
+def _normalize_ignored_target_ids(
+    value: Sequence[int] | frozenset[int] | set[int],
+    *,
+    vocabulary_size: int,
+    pad_token_id: int,
+) -> tuple[int, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(
+        value, (Sequence, set, frozenset)
+    ):
+        raise TrainingMetricsError(
+            "ignored_target_token_ids must be a collection of IDs."
+        )
+    normalized = tuple(
+        _require_token_id(
+            token_id,
+            f"ignored_target_token_ids[{index}]",
+            vocabulary_size=vocabulary_size,
+        )
+        for index, token_id in enumerate(value)
+    )
+    if len(set(normalized)) != len(normalized):
+        raise TrainingMetricsError("ignored_target_token_ids must be distinct.")
+    if pad_token_id in normalized:
+        raise TrainingMetricsError("PAD cannot be an ignored target token ID.")
+    return tuple(sorted(normalized))
+
+
 def _validate_batch_tensors(
     logits: Tensor,
     targets: Tensor,
@@ -399,6 +447,7 @@ def _validate_batch_tensors(
     vocabulary_size: int,
     pad_token_id: int,
     technique_token_ids: Sequence[int],
+    ignored_target_token_ids: Sequence[int],
 ) -> None:
     if not isinstance(logits, Tensor) or logits.ndim != 3:
         raise TrainingMetricsError("logits must have shape (batch, time, vocabulary).")
@@ -433,6 +482,16 @@ def _validate_batch_tensors(
         raise TrainingMetricsError(
             "post_duration_unknown_mask cannot mark a PAD target."
         )
+    if ignored_target_token_ids:
+        ignored_ids = torch.tensor(
+            tuple(ignored_target_token_ids),
+            dtype=torch.long,
+            device=targets.device,
+        )
+        if bool((unknown_mask & torch.isin(targets, ignored_ids)).any()):
+            raise TrainingMetricsError(
+                "post_duration_unknown_mask cannot mark an ignored target."
+            )
     technique_ids = torch.tensor(
         tuple(technique_token_ids), dtype=torch.long, device=targets.device
     )
