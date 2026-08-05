@@ -14,7 +14,7 @@ finished songs, audio, tablature, or a legal guarantee of “original” music.
 > commercial MIDI files or protected third-party material to this repository.
 > Dataset MIDI files are ignored by Git and none are included here.
 
-## Current status: Stages 1–3
+## Current status: Stages 1–4
 
 Stage 1 is implemented: repository setup, MIDI inspection and basic
 preprocessing. The executable workflow can:
@@ -82,9 +82,26 @@ Stage 3 training is implemented as well. It:
 - resumes only from a compatible checkpoint, restoring model, optimizer,
   scaler, data-loader, and random-number-generator state before continuing.
 
-Autoregressive sampling, seed-MIDI generation, token-to-MIDI decoding, and a
-generation/export command are **not implemented yet**. `configs/generate.yaml`
-remains a design placeholder; changing it does not generate anything.
+Stage 4 has a first unconditional generator. It:
+
+- safely loads `best.pt` on CPU first, verifies its exact manifest, tokenizer,
+  vocabulary, architecture, state tensors, and hashes, and only then moves the
+  model to the requested CPU or CUDA device;
+- samples reproducibly from `BOS` without a seed MIDI using temperature,
+  top-k, top-p, repetition penalty, a token limit, and bounded retries;
+- constrains token types and values to valid GuitarREMI continuations, limits
+  simultaneous guitar notes, rejects overlapping same-pitch notes, and
+  validates every decoded sequence before publishing it;
+- exports editable MIDI, adding an explicit constant +/-6-semitone RPN when
+  pitch-bend events are present;
+- writes exact token/provenance JSON, a non-ingestible generated-technique
+  sidecar, and an optional piano-roll PNG with bends and technique labels; and
+- publishes each complete run atomically under `outputs/generated/<run_id>/`
+  with SHA-256 hashes in a run manifest and never overwrites prior samples.
+
+Generation conditioned by a seed MIDI is **not implemented yet**. The current
+checkpoint is a one-epoch smoke model, so its outputs prove the complete path
+rather than represent a musically mature model.
 
 ## Architecture and main decisions
 
@@ -142,12 +159,12 @@ program streams.
 
 The implemented model is a compact two-layer autoregressive GRU rather than a
 Transformer. The current baseline uses a 64-dimensional embedding, 128 hidden
-units, dropout 0.2, and batch size 4. `data.max_sequence_length: 384` is a
+units, dropout 0.2, and batch size 4. `data.max_sequence_length: 512` is a
 safety bound rather than a truncation target: the loader raises an error if a
 stored sequence exceeds it.
 
 ```text
-configs/                    executable Stage 1–3 configs + generation template
+configs/                    executable Stage 1–4 configs
 data/raw/                   user-supplied MIDI (ignored by Git)
 data/processed/runs/        immutable normalized runs, each grouped by split
 data/tokenized/runs/        immutable REMI runs, each grouped by split
@@ -155,7 +172,7 @@ data/tokenized/manifest.json authoritative current tokenization manifest
 data/splits/                authoritative Stage 1 preprocessing manifest
 outputs/                    generated results, plots, and logs (ignored)
 checkpoints/                Stage 3 training runs and checkpoints (ignored)
-scripts/                    Stage 1–3 command-line entry points
+scripts/                    Stage 1–4 command-line entry points
 src/midi_idea_generator/    reusable package code
 tests/                      automated tests
 ```
@@ -251,7 +268,7 @@ Before tokenizing, review `configs/tokenize.yaml`. Stage 2 treats
 fragment and hash. It does not discover additional MIDI files placed in an old
 processed run.
 
-## Stage 1–3 commands
+## Stage 1–4 commands
 
 Inspect the raw collection:
 
@@ -339,6 +356,34 @@ Inspect the live and saved metrics with:
 tensorboard --logdir outputs/logs/training
 ```
 
+Generate four unconditional ideas with the exact checkpoint and tokenization
+manifest configured in `configs/generate.yaml`:
+
+```bash
+python scripts/generate.py --config configs/generate.yaml
+```
+
+The checkpoint path is explicit and must name a `best.pt` compatible with the
+configured Stage 2 manifest. Generation refuses stale tokenizers, mismatched
+vocabularies, unsafe output paths, malformed checkpoints, invalid token
+streams, empty scores, and ambiguous overlapping notes. The default output is:
+
+```text
+outputs/generated/<generation_run_id>/
+├── manifest.json
+├── sample-001.mid
+├── sample-001.tokens.json
+├── sample-001.techniques.generated.json
+├── sample-001.piano-roll.png
+└── ...
+```
+
+The generated-technique JSON intentionally does not use the ingestible
+`*.mid.techniques.json` suffix. It preserves exact `{type, note_index}` token
+semantics; GuitarREMI v1 knows slide direction but not its original target
+pitch. `generation.max_simultaneous_notes` defaults to 3 for riff-like output
+and can be set from 1 through the physical six-note guitar limit.
+
 Run the test suite:
 
 ```bash
@@ -355,10 +400,11 @@ default 50-epoch configuration includes validation-based early stopping after
 8 epochs without sufficient improvement and saves enough state for an exact,
 compatible continuation.
 
-Generation remains future work. The planned command will support an empty
-start or seed MIDI, a reproducible random seed, maximum token count,
-temperature, top-k, top-p, sample count, and a simple repetition penalty.
-Empty or invalid decoded MIDI must not be saved.
+Unconditional generation is available through `scripts/generate.py`. It uses a
+reproducible random seed, maximum/minimum token counts, temperature, top-k,
+top-p, sample count, repetition penalty, a simultaneous-note cap, and bounded
+retries. Invalid decoded MIDI is never published. Conditional continuation
+from a seed MIDI remains future work.
 
 ## Limitations
 
@@ -389,7 +435,11 @@ Empty or invalid decoded MIDI must not be saved.
   configured REMI grid, and keeps the single guitar program outside the token
   stream as sequence metadata.
 - Preprocessing cannot make an unsuitable or mislabeled dataset legally safe.
-- Training does not yet provide autoregressive sampling or MIDI export.
+- Seed-MIDI conditioning, beam search, and an interactive audition interface
+  are not implemented.
+- The current corpus has pitch-bend examples but no `COMPLETE` technique
+  sidecars. Technique tokens exist in the language and exporter, but a model
+  cannot learn their musical use until supervised examples are added.
 
 ## Roadmap
 
@@ -402,12 +452,12 @@ Empty or invalid decoded MIDI must not be saved.
 4. **Done:** compact GRU, CPU/CUDA training, validation, gradient clipping,
    compatible exact resume, atomic checkpoints, early stopping, reports, and
    TensorBoard metrics.
-5. Add temperature, top-k, and top-p sampling; optional seed MIDI; validation;
-   and export to `outputs/generated/`.
-
-The remaining planned interface is `python scripts/generate.py --config
-configs/generate.yaml`, optionally with `--seed-midi`. **That generation
-command is not implemented yet.**
+5. **Done:** reproducible unconditional temperature/top-k/top-p sampling,
+   GuitarREMI constraints, strict checkpoint provenance, MIDI/bend export,
+   generated-technique metadata, piano-roll images, and immutable manifests in
+   `outputs/generated/`.
+6. Add seed-MIDI conditioning, model-quality evaluation, and an audition/
+   curation workflow after training on the expanded corpus.
 
 ## License
 
@@ -433,7 +483,7 @@ garantizar “originalidad” musical en sentido legal.
 > MIDIs comerciales ni material protegido de terceros al repositorio. Git
 > ignora los archivos MIDI del dataset y este repositorio no incluye ninguno.
 
-## Estado actual: Etapas 1–3
+## Estado actual: Etapas 1–4
 
 La Etapa 1 está implementada: estructura del repositorio, inspección MIDI y
 preprocesamiento básico. El flujo ejecutable permite:
@@ -503,10 +553,27 @@ El entrenamiento de la Etapa 3 también está implementado. Esta etapa:
 - reanuda únicamente un checkpoint compatible, restaurando el modelo,
   optimizador, scaler, data loader y los generadores aleatorios antes de seguir.
 
-El muestreo autorregresivo, la generación condicionada por un MIDI semilla, la
-decodificación de tokens a MIDI y el comando de generación/exportación
-**todavía no están implementados**. `configs/generate.yaml` sigue siendo una
-plantilla de diseño; modificarla no genera nada.
+La Etapa 4 ya incluye una primera generación incondicional. Esta etapa:
+
+- carga `best.pt` primero en CPU, comprueba su manifiesto, tokenizer,
+  vocabulario, arquitectura, tensores e identidades SHA-256 exactas, y solo
+  después mueve el modelo al dispositivo CPU o CUDA solicitado;
+- muestrea de forma reproducible desde `BOS`, sin MIDI semilla, usando
+  temperature, top-k, top-p, penalización de repetición, límite de tokens e
+  intentos acotados;
+- restringe tipos y valores a continuaciones GuitarREMI válidas, limita las
+  notas simultáneas de guitarra, rechaza notas superpuestas del mismo pitch y
+  valida cada secuencia decodificada antes de publicarla;
+- exporta MIDI editable e incorpora el RPN explícito y constante de +/-6
+  semitonos cuando la muestra contiene pitch bends;
+- escribe JSON de tokens y procedencia, un sidecar no ingerible de técnicas
+  generadas y un piano-roll PNG opcional con bends y etiquetas; y
+- publica cada corrida completa de forma atómica en
+  `outputs/generated/<run_id>/`, con hashes, sin sobrescribir muestras previas.
+
+La continuación condicionada por un MIDI semilla **todavía no está
+implementada**. El checkpoint actual es una prueba de una sola época: demuestra
+el flujo completo, pero aún no representa un modelo musicalmente maduro.
 
 ## Arquitectura y decisiones principales
 
@@ -565,14 +632,14 @@ varios canales o programas.
 
 El modelo implementado es una GRU autorregresiva pequeña de dos capas, no un
 Transformer. El baseline actual usa embedding de 64 dimensiones, estado oculto
-de 128, dropout 0.2 y batch 4. `data.max_sequence_length: 384` es un límite de
+de 128, dropout 0.2 y batch 4. `data.max_sequence_length: 512` es un límite de
 seguridad, no un objetivo de truncado: el loader produce un error si una
 secuencia guardada lo supera.
 
 ## Estructura del proyecto
 
 ```text
-configs/                    configs ejecutables de Etapas 1–3 + generación futura
+configs/                    configs ejecutables de Etapas 1–4
 data/raw/                   MIDI del usuario (ignorado por Git)
 data/processed/runs/        corridas inmutables, cada una separada por split
 data/tokenized/runs/        corridas REMI inmutables separadas por split
@@ -580,7 +647,7 @@ data/tokenized/manifest.json manifiesto autoritativo de tokenización actual
 data/splits/                manifiesto autoritativo de preprocesamiento
 outputs/                    resultados, gráficos y logs (ignorados)
 checkpoints/                corridas y checkpoints de Etapa 3 (ignorados)
-scripts/                    comandos de las Etapas 1–3
+scripts/                    comandos de las Etapas 1–4
 src/midi_idea_generator/    código reutilizable del paquete
 tests/                      tests automáticos
 ```
@@ -680,7 +747,7 @@ autoritativo `data/splits/manifest.json` y verifica cada fragmento referenciado
 y su hash. No descubre MIDIs adicionales colocados dentro de una corrida
 procesada antigua.
 
-## Comandos de las Etapas 1–3
+## Comandos de las Etapas 1–4
 
 Inspecciona la colección:
 
@@ -770,6 +837,34 @@ Inspecciona las métricas guardadas y en vivo con:
 tensorboard --logdir outputs/logs/training
 ```
 
+Genera cuatro ideas incondicionales con el checkpoint y el manifiesto de
+tokens indicados explícitamente en `configs/generate.yaml`:
+
+```bash
+python scripts/generate.py --config configs/generate.yaml
+```
+
+El checkpoint debe ser un `best.pt` compatible con el manifiesto de la Etapa
+2 configurado. La generación rechaza tokenizers antiguos, vocabularios
+distintos, rutas inseguras, checkpoints malformados, streams inválidos, scores
+vacíos y notas ambiguas superpuestas. La salida predeterminada es:
+
+```text
+outputs/generated/<generation_run_id>/
+├── manifest.json
+├── sample-001.mid
+├── sample-001.tokens.json
+├── sample-001.techniques.generated.json
+├── sample-001.piano-roll.png
+└── ...
+```
+
+El JSON de técnicas generadas no usa deliberadamente el sufijo ingerible
+`*.mid.techniques.json`. Conserva la semántica exacta `{type, note_index}` de
+los tokens; GuitarREMI v1 conoce la dirección de un slide, pero no su pitch
+destino original. `generation.max_simultaneous_notes` vale 3 por defecto para
+resultados tipo riff y admite valores entre 1 y el límite físico de seis notas.
+
 Ejecuta los tests:
 
 ```bash
@@ -787,10 +882,11 @@ arriba. La configuración predeterminada de 50 épocas incluye early stopping
 basado en validación después de 8 épocas sin mejora suficiente y guarda el
 estado necesario para una continuación exacta y compatible.
 
-La generación sigue siendo trabajo futuro. El comando previsto admitirá inicio
-vacío o MIDI semilla, semilla aleatoria reproducible, máximo de tokens,
-temperature, top-k, top-p, número de muestras y una penalización sencilla de
-repetición. No deberán guardarse MIDIs vacíos o inválidos.
+La generación incondicional está disponible mediante `scripts/generate.py`.
+Admite semilla reproducible, límites mínimo/máximo de tokens, temperature,
+top-k, top-p, cantidad de muestras, penalización de repetición, límite de notas
+simultáneas e intentos acotados. Nunca publica un MIDI decodificado inválido.
+La continuación condicionada desde un MIDI semilla sigue siendo trabajo futuro.
 
 ## Limitaciones actuales
 
@@ -822,8 +918,11 @@ repetición. No deberán guardarse MIDIs vacíos o inválidos.
   fuera del stream, como metadata de la secuencia.
 - El preprocesamiento no vuelve legalmente seguro un dataset inadecuado o mal
   etiquetado.
-- El entrenamiento todavía no incluye muestreo autorregresivo ni exportación
-  MIDI.
+- El condicionamiento con MIDI semilla, beam search y una interfaz interactiva
+  de audición todavía no están implementados.
+- El corpus actual contiene pitch bends, pero ningún sidecar de técnicas
+  `COMPLETE`. Los tokens y el exportador ya existen, pero el modelo no puede
+  aprender el uso musical de esas técnicas hasta recibir ejemplos supervisados.
 
 ## Roadmap
 
@@ -838,12 +937,12 @@ repetición. No deberán guardarse MIDIs vacíos o inválidos.
 4. **Hecho:** GRU compacta, entrenamiento CPU/CUDA, validación, gradient
    clipping, reanudación exacta y compatible, checkpoints atómicos, early
    stopping, reportes y métricas en TensorBoard.
-5. Agregar muestreo con temperature, top-k y top-p; MIDI semilla opcional;
-   validación; y exportación a `outputs/generated/`.
-
-La interfaz pendiente prevista es `python scripts/generate.py --config
-configs/generate.yaml`, opcionalmente con `--seed-midi`. **Ese comando de
-generación todavía no está implementado.**
+5. **Hecho:** muestreo incondicional reproducible con temperature/top-k/top-p,
+   restricciones GuitarREMI, procedencia estricta del checkpoint, exportación
+   MIDI/bends, metadata de técnicas generadas, piano-roll y manifiestos
+   inmutables en `outputs/generated/`.
+6. Agregar condicionamiento por MIDI semilla, evaluación de calidad y un flujo
+   de audición/curación después de entrenar con el corpus ampliado.
 
 ## Licencia
 

@@ -400,6 +400,117 @@ def decode_symbolic_token_ids(
     return DecodedMidi(score=score, techniques=techniques)
 
 
+def canonicalize_symbolic_token_ids(
+    tokenizer: REMI,
+    token_ids: Sequence[int],
+    programs: Sequence[tuple[int, bool]],
+) -> tuple[tuple[int, ...], DecodedMidi]:
+    """Canonicalize a valid generated stream and decode it.
+
+    Autoregressive generation can end on a syntactically legal trailing
+    ``Bar`` token which carries no event in MIDI.  MidiTok consequently drops
+    that token when it re-encodes the decoded score.  Stored corpus sequences
+    are already canonical and :func:`decode_symbolic_token_ids` deliberately
+    rejects such a mismatch; generation instead needs one explicit
+    normalization boundary before artifacts are published.
+
+    The input must still have valid REMI transitions and valid postfix guitar
+    techniques.  Only the score's canonical re-encoding is returned, so this
+    function cannot be used to conceal malformed model output.
+    """
+
+    musical_ids = _validated_stored_ids(tokenizer, token_ids)
+    normalized_programs = _normalize_programs(programs)
+    sequence = TokSequence(ids=list(musical_ids))
+    try:
+        tokenizer.complete_sequence(sequence)
+    except Exception as exc:
+        raise TokenizationError(
+            f"Could not resolve generated REMI token IDs: {exc}"
+        ) from exc
+    error_ratio = _token_error_ratio(tokenizer, sequence)
+    if error_ratio != 0.0:
+        raise TokenizationError(
+            "Generated REMI token sequence has an error ratio of "
+            f"{error_ratio:g}."
+        )
+
+    tokens = tuple(str(token) for token in sequence.tokens)
+    vocabulary = _vocabulary(tokenizer)
+    base_tokens = tuple(
+        token for token in tokens if token not in TECHNIQUE_TYPE_BY_TOKEN
+    )
+    try:
+        base_ids = tuple(int(vocabulary[token]) for token in base_tokens)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TokenizationError(
+            "Generated REMI stream contains an unknown base token."
+        ) from exc
+    base_sequence = TokSequence(ids=list(base_ids))
+    try:
+        tokenizer.complete_sequence(base_sequence)
+        score = tokenizer.decode(
+            [list(base_ids)], programs=list(normalized_programs)
+        )
+    except Exception as exc:
+        raise TokenizationError(
+            f"Could not decode generated REMI token IDs: {exc}"
+        ) from exc
+    track, _ = _validated_single_track(score, source="generated token sequence")
+    canonical_base = _encode_single_sequence(
+        tokenizer,
+        score,
+        source="generated token sequence",
+        no_preprocess_score=True,
+    )
+    normalized_tokens = list(tokens)
+    normalized_base_tokens = list(base_tokens)
+    canonical_base_tokens = tuple(str(token) for token in canonical_base.tokens)
+    while (
+        tuple(normalized_base_tokens) != canonical_base_tokens
+        and normalized_base_tokens
+        and normalized_base_tokens[-1] == "Bar_None"
+        and normalized_tokens
+        and normalized_tokens[-1] == "Bar_None"
+    ):
+        normalized_base_tokens.pop()
+        normalized_tokens.pop()
+    if tuple(normalized_base_tokens) != canonical_base_tokens:
+        raise TokenizationError(
+            "Canonicalization changed generated musical events, not only a "
+            "redundant trailing Bar."
+        )
+    techniques = _extract_postfix_techniques(
+        normalized_tokens,
+        canonical_base,
+        track,
+        source="generated token sequence",
+    )
+    canonical = _encode_score_with_techniques(
+        tokenizer,
+        score,
+        techniques,
+        source="generated token sequence",
+    )
+    canonical_musical_ids = _validated_musical_ids(tokenizer, canonical.ids)
+    if _token_error_ratio(tokenizer, canonical) != 0.0:
+        raise TokenizationError(
+            "Canonical generated REMI token sequence contains invalid transitions."
+        )
+    special_ids = get_special_token_ids(tokenizer)
+    canonical_ids = (
+        special_ids.bos,
+        *canonical_musical_ids,
+        special_ids.eos,
+    )
+    decoded = decode_symbolic_token_ids(
+        tokenizer,
+        canonical_ids,
+        normalized_programs,
+    )
+    return canonical_ids, decoded
+
+
 def decode_token_ids(
     tokenizer: REMI,
     token_ids: Sequence[int],
@@ -1031,6 +1142,7 @@ __all__ = [
     "TechniqueAnnotation",
     "TokenizationError",
     "build_tokenizer",
+    "canonicalize_symbolic_token_ids",
     "decode_symbolic_token_ids",
     "decode_token_ids",
     "encode_midi",

@@ -1,26 +1,25 @@
-# FUTURE-STAGE PLACEHOLDER
-# Generation and token-to-MIDI decoding are not implemented through Stage 3.
-# This file records planned defaults; scripts/generate.py is not available yet.
-status: planned
-implemented: false
-
 seed: 42
-device: auto  # Planned values: auto, cpu, or cuda.
+device: auto
 
 paths:
-  checkpoint: null
-  tokenizer: null
+  checkpoint: checkpoints/20260805T013033Z-cc438e945e/best.pt
+  tokenization_manifest: data/tokenized/manifest.json
   output_dir: outputs/generated
-  seed_midi: null
 
 generation:
-  max_tokens: 512
+  min_tokens: 32
+  max_tokens: 256
   temperature: 0.9
   top_k: 20
   top_p: 0.95
-  repetition_penalty: 1.0
+  repetition_penalty: 1.05
+  max_simultaneous_notes: 3
   num_samples: 4
+  max_attempts_per_sample: 25
 
-validation:
-  reject_empty_midi: true
-  reject_invalid_sequences: true
+midi:
+  program: 29
+
+visualization:
+  enabled: true
+  dpi: 160

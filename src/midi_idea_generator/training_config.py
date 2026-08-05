@@ -42,7 +42,7 @@ class ModelConfig:
 class DataConfig:
     """Batching limits for already-tokenized sequences."""
 
-    max_sequence_length: int = 384
+    max_sequence_length: int = 512
     batch_size: int = 4
     num_workers: int = 0
 
@@ -300,7 +300,7 @@ def _load_data(root: Mapping[str, Any]) -> DataConfig:
 
     config = DataConfig(
         max_sequence_length=_as_int(
-            values.get("max_sequence_length", 384),
+            values.get("max_sequence_length", 512),
             "data.max_sequence_length",
         ),
         batch_size=_as_int(values.get("batch_size", 4), "data.batch_size"),

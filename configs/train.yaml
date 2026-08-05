@@ -19,8 +19,9 @@ model:
   dropout: 0.2
 
 data:
-  # The longest current riff is 352 tokens; 384 avoids truncating it.
-  max_sequence_length: 384
+  # The densest current 4-bar phrase is 450 tokens. Keep headroom and reject
+  # anything above this bound rather than silently truncating it.
+  max_sequence_length: 512
   batch_size: 4
   num_workers: 0
 

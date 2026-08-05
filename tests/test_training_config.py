@@ -31,7 +31,7 @@ def _valid_payload() -> dict[str, Any]:
             "dropout": 0.2,
         },
         "data": {
-            "max_sequence_length": 384,
+            "max_sequence_length": 512,
             "batch_size": 4,
             "num_workers": 0,
         },
@@ -102,7 +102,7 @@ def test_load_training_config_resolves_paths_and_preserves_contract(
     assert config.model.hidden_dim == 128
     assert config.model.num_layers == 2
     assert config.model.dropout == pytest.approx(0.2)
-    assert config.data.max_sequence_length == 384
+    assert config.data.max_sequence_length == 512
     assert config.data.batch_size == 4
     assert config.data.num_workers == 0
     assert config.training.epochs == 50
@@ -132,7 +132,7 @@ def test_sections_use_documented_defaults(tmp_path: Path) -> None:
     assert config.device == "auto"
     assert config.model.embedding_dim == 64
     assert config.model.hidden_dim == 128
-    assert config.data.max_sequence_length == 384
+    assert config.data.max_sequence_length == 512
     assert config.training.epochs == 50
     assert config.training.mixed_precision == "auto"
 
@@ -378,6 +378,6 @@ def test_repository_training_config_matches_small_corpus_baseline() -> None:
     assert config.model.embedding_dim == 64
     assert config.model.hidden_dim == 128
     assert config.model.num_layers == 2
-    assert config.data.max_sequence_length == 384
+    assert config.data.max_sequence_length == 512
     assert config.data.batch_size == 4
     assert config.training.early_stopping_patience == 8
