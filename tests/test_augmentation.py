@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pretty_midi
 import pytest
 
 from midi_idea_generator.augmentation import (
@@ -10,6 +11,7 @@ from midi_idea_generator.augmentation import (
     transpose_midi,
 )
 from midi_idea_generator.config import AugmentationConfig
+from midi_idea_generator.midi_io import canonical_pitch_bend_range_controls
 from midi_idea_generator.preprocessing import build_single_track_midi
 
 
@@ -94,6 +96,38 @@ def test_transpose_midi_preserves_tempo_meter_and_note_timing(
         (change.numerator, change.denominator, change.time)
         for change in transposed.time_signature_changes
     ] == [(4, 4, 0.0)]
+
+
+def test_transposition_preserves_pitch_bend_curve_and_range(
+    make_instrument,
+) -> None:
+    source = make_instrument([(60, 0.0, 1.0)])
+    source.pitch_bends = [
+        pretty_midi.PitchBend(pitch=4096, time=0.25),
+        pretty_midi.PitchBend(pitch=0, time=0.75),
+    ]
+    source.control_changes = canonical_pitch_bend_range_controls()
+    midi = build_single_track_midi(source, tempo_bpm=120.0)
+
+    transposed = transpose_midi(
+        midi,
+        semitones=5,
+        pitch_min=21,
+        pitch_max=108,
+    )
+
+    assert transposed is not None
+    output = transposed.instruments[0]
+    assert [note.pitch for note in output.notes] == [65]
+    assert [(bend.pitch, bend.time) for bend in output.pitch_bends] == [
+        (4096, 0.25),
+        (0, 0.75),
+    ]
+    assert [
+        (change.number, change.value, change.time)
+        for change in output.control_changes
+    ] == [(101, 0, 0.0), (100, 0, 0.0), (6, 6, 0.0)]
+    assert [note.pitch for note in source.notes] == [60]
 
 
 def test_augmentation_offsets_are_ordered_and_limited_to_configured_splits() -> None:

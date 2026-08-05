@@ -12,6 +12,7 @@ from midi_idea_generator.config import TrackSelectionConfig, ValidationConfig
 from midi_idea_generator.midi_io import (
     MidiReadError,
     MidiWriteError,
+    canonical_pitch_bend_range_controls,
     discover_midi_files,
     inspect_midi,
     read_midi,
@@ -105,7 +106,10 @@ def test_inspect_midi_reports_meter_pitch_bend_and_range_incompatibilities(
     assert any("Unsupported time signature" in issue for issue in inspection.issues)
     assert any("No valid instrumental track" in issue for issue in inspection.issues)
     assert any("outside 21-108" in issue for issue in inspection.tracks[0].issues)
-    assert "Track contains pitch bends" in inspection.tracks[0].issues
+    assert (
+        "Expressive pitch bends require an explicit range RPN"
+        in inspection.tracks[0].issues
+    )
     assert inspection.discard_reason is not None
 
 
@@ -131,23 +135,109 @@ def test_inspection_rejects_control_changes_that_would_be_lost(
 
 def test_inspection_accepts_guitar_pro_pitch_bend_range_setup(
     tmp_path: Path,
-    make_instrument,
-    write_midi_file,
+    write_pitch_bend_midi_file,
 ) -> None:
-    instrument = make_instrument([(60, 0.0, 1.0)])
-    instrument.control_changes.extend(
-        [
-            pretty_midi.ControlChange(number=101, value=0, time=0.0),
-            pretty_midi.ControlChange(number=100, value=0, time=0.0),
-            pretty_midi.ControlChange(number=6, value=6, time=0.0),
-        ]
+    path = write_pitch_bend_midi_file(
+        tmp_path / "guitar-pro-rpn.mid",
+        bends=[(240, 4096), (480, 0)],
     )
-    path = write_midi_file(tmp_path / "guitar-pro-rpn.mid", [instrument])
 
     inspection = inspect_midi(path, ValidationConfig())
 
     assert inspection.compatible is True
     assert inspection.tracks[0].issues == ()
+    assert inspection.tracks[0].has_pitch_bends is True
+    assert inspection.tracks[0].num_pitch_bend_events == 2
+    assert inspection.tracks[0].num_expressive_pitch_bend_events == 1
+    assert inspection.tracks[0].source_pitch_bend_range_semitones == 6.0
+
+
+def test_inspection_rejects_changing_or_out_of_range_pitch_bends(
+    tmp_path: Path,
+    write_pitch_bend_midi_file,
+) -> None:
+    changing = write_pitch_bend_midi_file(
+        tmp_path / "changing-range.mid",
+        bends=[(240, 1024)],
+        range_events=[(0, 6), (120, 2)],
+    )
+    too_wide = write_pitch_bend_midi_file(
+        tmp_path / "too-wide.mid",
+        bends=[(240, 8191)],
+        range_events=[(0, 12)],
+    )
+    late_range = write_pitch_bend_midi_file(
+        tmp_path / "late-range.mid",
+        bends=[(120, 1024)],
+        range_events=[(240, 6)],
+    )
+
+    changing_inspection = inspect_midi(changing, ValidationConfig())
+    wide_inspection = inspect_midi(too_wide, ValidationConfig())
+    late_inspection = inspect_midi(late_range, ValidationConfig())
+
+    assert changing_inspection.compatible is False
+    assert any(
+        "range changes" in issue
+        for issue in changing_inspection.tracks[0].issues
+    )
+    assert wide_inspection.compatible is False
+    assert any(
+        "excursion exceeds" in issue for issue in wide_inspection.tracks[0].issues
+    )
+    assert late_inspection.compatible is False
+    assert any(
+        "declared after" in issue for issue in late_inspection.tracks[0].issues
+    )
+
+
+def test_atomic_writer_preserves_bends_and_orders_rpn_before_wheel(
+    tmp_path: Path,
+    make_instrument,
+) -> None:
+    instrument = make_instrument([(60, 0.0, 1.0)], program=29)
+    instrument.control_changes = canonical_pitch_bend_range_controls()
+    instrument.pitch_bends = [
+        pretty_midi.PitchBend(pitch=4096, time=0.0),
+        pretty_midi.PitchBend(pitch=0, time=1.0),
+    ]
+    midi = pretty_midi.PrettyMIDI(initial_tempo=120.0, resolution=480)
+    midi.time_signature_changes.append(pretty_midi.TimeSignature(4, 4, 0.0))
+    midi.instruments.append(instrument)
+    path = tmp_path / "ordered-rpn.mid"
+
+    write_midi(midi, path)
+    restored = read_midi(path)
+    raw = mido.MidiFile(path)
+    absolute_tick = 0
+    at_zero: list[tuple[str, int | None]] = []
+    for message in raw.tracks[1]:
+        absolute_tick += message.time
+        if absolute_tick == 0 and message.type in {
+            "control_change",
+            "pitchwheel",
+        }:
+            at_zero.append(
+                (
+                    message.type,
+                    message.control if message.type == "control_change" else None,
+                )
+            )
+
+    restored_bends = [
+        (bend.pitch, bend.time)
+        for bend in restored.instruments[0].pitch_bends
+    ]
+    assert restored_bends == [
+        (4096, pytest.approx(0.0)),
+        (0, pytest.approx(1.0)),
+    ]
+    assert at_zero == [
+        ("control_change", 101),
+        ("control_change", 100),
+        ("control_change", 6),
+        ("pitchwheel", None),
+    ]
 
 
 def test_inspection_accepts_neutral_pitchwheel_resets(

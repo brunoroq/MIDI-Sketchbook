@@ -17,6 +17,23 @@ import yaml
 from .config import ConfigError
 
 
+GUITAR_TECHNIQUE_TOKENS: tuple[str, ...] = (
+    "Technique_DEAD-NOTE",
+    "Technique_PALM-MUTE-ON",
+    "Technique_PALM-MUTE-OFF",
+    "Technique_SLIDE-UP",
+    "Technique_SLIDE-DOWN",
+    "Technique_VIBRATO",
+)
+"""Ordinary REMI tokens reserved for the first guitar-technique language."""
+
+PITCH_BEND_RANGE: tuple[int, int, int] = (-8191, 8191, 65)
+"""Symmetric MidiTok pitch-wheel bins, deliberately including exact zero."""
+
+PITCH_BEND_SENSITIVITY_SEMITONES = 6
+"""Canonical pitch-wheel sensitivity used by the Guitar Pro source contract."""
+
+
 @dataclass(frozen=True, slots=True)
 class TokenizationPathsConfig:
     """Resolved Stage 1 input and Stage 2 output locations."""
@@ -57,6 +74,10 @@ class RemiTokenizerConfig:
     num_tempos: int = 32
     tempo_min: float = 40.0
     tempo_max: float = 250.0
+    use_pitch_bends: bool = True
+    pitch_bend_range: tuple[int, int, int] = PITCH_BEND_RANGE
+    pitch_bend_sensitivity_semitones: int = PITCH_BEND_SENSITIVITY_SEMITONES
+    technique_tokens: tuple[str, ...] = GUITAR_TECHNIQUE_TOKENS
     add_trailing_bars: bool = True
     max_bar_embedding: int | None = None
 
@@ -283,6 +304,38 @@ def _optional_positive_int(value: object, key: str) -> int | None:
     return converted
 
 
+def _load_pitch_bend_range(value: object) -> tuple[int, int, int]:
+    key = "tokenizer.pitch_bend_range"
+    if not isinstance(value, list) or len(value) != 3:
+        raise ConfigError(f"'{key}' must be [minimum, maximum, bins].")
+    converted = tuple(
+        _as_int(item, f"{key}[{index}]")
+        for index, item in enumerate(value)
+    )
+    if converted != PITCH_BEND_RANGE:
+        raise ConfigError(
+            f"Stage 2 requires '{key}: [{PITCH_BEND_RANGE[0]}, "
+            f"{PITCH_BEND_RANGE[1]}, {PITCH_BEND_RANGE[2]}]' so pitch-wheel zero "
+            "has an exact vocabulary token."
+        )
+    return converted
+
+
+def _load_technique_tokens(value: object) -> tuple[str, ...]:
+    key = "tokenizer.technique_tokens"
+    if not isinstance(value, list) or not all(
+        isinstance(token, str) and token for token in value
+    ):
+        raise ConfigError(f"'{key}' must be a list of non-empty strings.")
+    tokens = tuple(value)
+    if tokens != GUITAR_TECHNIQUE_TOKENS:
+        raise ConfigError(
+            f"'{key}' must contain the canonical guitar-technique tokens in their "
+            "documented order."
+        )
+    return tokens
+
+
 def _load_tokenizer(root: Mapping[str, Any]) -> RemiTokenizerConfig:
     values = _section(root, "tokenizer")
     allowed = {
@@ -298,6 +351,10 @@ def _load_tokenizer(root: Mapping[str, Any]) -> RemiTokenizerConfig:
         "num_tempos",
         "tempo_min",
         "tempo_max",
+        "use_pitch_bends",
+        "pitch_bend_range",
+        "pitch_bend_sensitivity_semitones",
+        "technique_tokens",
         "add_trailing_bars",
         "max_bar_embedding",
     }
@@ -341,6 +398,22 @@ def _load_tokenizer(root: Mapping[str, Any]) -> RemiTokenizerConfig:
         num_tempos=_as_int(values.get("num_tempos", 32), "tokenizer.num_tempos"),
         tempo_min=_as_float(values.get("tempo_min", 40), "tokenizer.tempo_min"),
         tempo_max=_as_float(values.get("tempo_max", 250), "tokenizer.tempo_max"),
+        use_pitch_bends=_as_bool(
+            values.get("use_pitch_bends", True), "tokenizer.use_pitch_bends"
+        ),
+        pitch_bend_range=_load_pitch_bend_range(
+            values.get("pitch_bend_range", list(PITCH_BEND_RANGE))
+        ),
+        pitch_bend_sensitivity_semitones=_as_int(
+            values.get(
+                "pitch_bend_sensitivity_semitones",
+                PITCH_BEND_SENSITIVITY_SEMITONES,
+            ),
+            "tokenizer.pitch_bend_sensitivity_semitones",
+        ),
+        technique_tokens=_load_technique_tokens(
+            values.get("technique_tokens", list(GUITAR_TECHNIQUE_TOKENS))
+        ),
         add_trailing_bars=_as_bool(
             values.get("add_trailing_bars", True), "tokenizer.add_trailing_bars"
         ),
@@ -369,6 +442,15 @@ def _load_tokenizer(root: Mapping[str, Any]) -> RemiTokenizerConfig:
         )
     if not config.use_tempos:
         raise ConfigError("Stage 2 requires 'tokenizer.use_tempos: true'.")
+    if not config.use_pitch_bends:
+        raise ConfigError("Stage 2 requires 'tokenizer.use_pitch_bends: true'.")
+    if (
+        config.pitch_bend_sensitivity_semitones
+        != PITCH_BEND_SENSITIVITY_SEMITONES
+    ):
+        raise ConfigError(
+            "Stage 2 requires 'tokenizer.pitch_bend_sensitivity_semitones: 6'."
+        )
     if not config.add_trailing_bars:
         raise ConfigError("Stage 2 requires 'tokenizer.add_trailing_bars: true'.")
     return config

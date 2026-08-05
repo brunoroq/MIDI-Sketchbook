@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 
 import mido
+import pretty_midi
 import pytest
 
 from midi_idea_generator.config import ProcessingConfig
@@ -16,9 +17,11 @@ from midi_idea_generator.midi_io import (
     write_midi,
 )
 from midi_idea_generator.preprocessing import (
+    PitchBendNormalizationError,
     QuantizationCollisionError,
     build_single_track_midi,
     normalize_instrument,
+    normalize_pitch_bends,
     quantization_step_seconds,
     quantize_instrument,
     remove_initial_silence,
@@ -85,6 +88,70 @@ def test_normalization_collapses_only_duplicates_present_in_source(
         (59, 76, 0.0, 0.25),
         (59, 77, 0.0, 0.25),
         (59, 76, 0.0, 0.5),
+    ]
+
+
+def test_pitch_bends_are_normalized_to_six_semitones_and_one_per_tick(
+    make_instrument,
+) -> None:
+    source = make_instrument([(60, 0.0, 1.0)])
+    source.pitch_bends = [
+        pretty_midi.PitchBend(pitch=1024, time=0.25),
+        pretty_midi.PitchBend(pitch=2048, time=0.25),
+        pretty_midi.PitchBend(pitch=0, time=0.5),
+    ]
+
+    normalized = normalize_pitch_bends(
+        source,
+        tempo_bpm=120.0,
+        resolution=480,
+        source_range_semitones=12.0,
+    )
+
+    assert [(bend.pitch, bend.time) for bend in normalized.pitch_bends] == [
+        (4096, pytest.approx(0.25)),
+        (0, pytest.approx(0.5)),
+    ]
+    assert [
+        (change.number, change.value, change.time)
+        for change in normalized.control_changes
+    ] == [(101, 0, 0.0), (100, 0, 0.0), (6, 6, 0.0)]
+    assert [bend.pitch for bend in source.pitch_bends] == [1024, 2048, 0]
+
+
+def test_pitch_bend_normalization_rejects_excursions_over_six_semitones(
+    make_instrument,
+) -> None:
+    source = make_instrument([(60, 0.0, 1.0)])
+    source.pitch_bends = [pretty_midi.PitchBend(pitch=5000, time=0.25)]
+
+    with pytest.raises(PitchBendNormalizationError, match="excursion exceeds"):
+        normalize_pitch_bends(
+            source,
+            tempo_bpm=120.0,
+            resolution=480,
+            source_range_semitones=12.0,
+        )
+
+
+def test_remove_initial_silence_carries_effective_pitch_bend_state(
+    make_instrument,
+) -> None:
+    source = make_instrument([(60, 2.0, 2.5)])
+    source.pitch_bends = [
+        pretty_midi.PitchBend(pitch=4096, time=1.0),
+        pretty_midi.PitchBend(pitch=0, time=2.25),
+    ]
+
+    shifted = remove_initial_silence(source, tempo_bpm=120.0, resolution=480)
+
+    assert [(bend.pitch, bend.time) for bend in shifted.pitch_bends] == [
+        (4096, pytest.approx(0.0)),
+        (0, pytest.approx(0.25)),
+    ]
+    assert [(bend.pitch, bend.time) for bend in source.pitch_bends] == [
+        (4096, 1.0),
+        (0, 2.25),
     ]
 
 
@@ -187,6 +254,73 @@ def test_phrase_windows_are_half_open_and_crossing_notes_are_clipped(
     assert second_notes[63].end == pytest.approx(4.0)
     assert third_notes[64].start == pytest.approx(0.0)
     assert third_notes[64].end == pytest.approx(0.5)
+
+
+def test_pitch_bend_crossing_boundary_carries_state_and_resets_fragments(
+    make_instrument,
+) -> None:
+    source = make_instrument([(60, 0.0, 0.5), (64, 4.0, 4.5)])
+    source.pitch_bends = [
+        pretty_midi.PitchBend(pitch=4096, time=3.5),
+        pretty_midi.PitchBend(pitch=0, time=4.5),
+    ]
+    config = ProcessingConfig(
+        phrase_bars=2,
+        include_partial_final_phrase=True,
+        min_notes_per_phrase=1,
+    )
+
+    phrases = split_instrument_into_phrases(
+        source,
+        tempo_bpm=120.0,
+        config=config,
+        resolution=480,
+    )
+
+    assert [phrase.phrase_index for phrase in phrases] == [0, 1]
+    first_bends = [
+        (bend.pitch, bend.time)
+        for bend in phrases[0].midi.instruments[0].pitch_bends
+    ]
+    second_bends = [
+        (bend.pitch, bend.time)
+        for bend in phrases[1].midi.instruments[0].pitch_bends
+    ]
+    assert first_bends == [
+        (4096, pytest.approx(3.5)),
+        (0, pytest.approx(4.0)),
+    ]
+    assert second_bends == [
+        (4096, pytest.approx(0.0)),
+        (0, pytest.approx(0.5)),
+    ]
+    assert phrases[0].synthetic_initial_pitch_bend is False
+    assert phrases[0].synthetic_final_pitch_bend_reset is True
+    assert phrases[1].synthetic_initial_pitch_bend is True
+    assert phrases[1].synthetic_final_pitch_bend_reset is False
+    assert all(phrase.pitch_bend_range_semitones == 6 for phrase in phrases)
+
+
+def test_pitch_bend_exactly_at_boundary_belongs_to_next_phrase(
+    make_instrument,
+) -> None:
+    source = make_instrument([(60, 0.0, 0.5), (64, 4.0, 4.5)])
+    source.pitch_bends = [pretty_midi.PitchBend(pitch=2048, time=4.0)]
+    config = ProcessingConfig(phrase_bars=2, include_partial_final_phrase=True)
+
+    phrases = split_instrument_into_phrases(source, 120.0, config, resolution=480)
+
+    assert phrases[0].midi.instruments[0].pitch_bends == []
+    second_bends = [
+        (bend.pitch, bend.time)
+        for bend in phrases[1].midi.instruments[0].pitch_bends
+    ]
+    assert second_bends == [
+        (2048, pytest.approx(0.0)),
+        (0, pytest.approx(4.0)),
+    ]
+    assert phrases[1].synthetic_initial_pitch_bend is False
+    assert phrases[1].synthetic_final_pitch_bend_reset is True
 
 
 def test_phrase_partial_window_and_minimum_note_behavior(make_instrument) -> None:

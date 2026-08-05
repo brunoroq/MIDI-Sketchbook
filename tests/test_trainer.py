@@ -66,6 +66,7 @@ class _SyntheticDataset:
         return {
             "input_ids": ids[:-1],
             "target_ids": ids[1:],
+            "loss_mask": (True,) * (len(ids) - 1),
             "length": len(ids) - 1,
             "sequence_id": f"{self.split}-{index}",
             "split": self.split,

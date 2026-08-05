@@ -1,4 +1,4 @@
-"""Pitch-only data augmentation for processed MIDI phrases."""
+"""Pitch transposition that preserves relative pitch-wheel expression."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def transpose_instrument(
     pitch_min: int,
     pitch_max: int,
 ) -> pretty_midi.Instrument | None:
-    """Transpose a full track or return ``None`` if any pitch leaves range."""
+    """Transpose notes while copying bends/RPN, or reject out-of-range notes."""
 
     transposed_pitches = [note.pitch + semitones for note in instrument.notes]
     if any(pitch < pitch_min or pitch > pitch_max for pitch in transposed_pitches):
@@ -43,7 +43,7 @@ def transpose_midi(
     pitch_min: int,
     pitch_max: int,
 ) -> pretty_midi.PrettyMIDI | None:
-    """Transpose a stage-one single-track MIDI without changing its timing."""
+    """Transpose a Stage 1 MIDI without changing timing or pitch-wheel curves."""
 
     if len(midi.instruments) != 1:
         raise ValueError("Stage-one phrase MIDI must contain exactly one instrument")

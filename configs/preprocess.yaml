@@ -14,7 +14,11 @@ validation:
   # Many simple MIDI exports omit an explicit time-signature event. When this
   # is true, a missing event is treated as the configured 4/4 signature.
   allow_missing_time_signature: true
-  reject_pitch_bends: true  # Must remain true in Stage 1.
+  # Expressive pitch wheels are accepted only when the source declares one
+  # constant range. Stage 1 normalizes every accepted curve to +/-6 semitones.
+  reject_pitch_bends: false
+  canonical_pitch_bend_range_semitones: 6
+  require_explicit_pitch_bend_range: true
   exclude_drums: true  # Must remain true in Stage 1.
   min_notes_per_track: 1
   tempo_tolerance: 0.01

@@ -26,8 +26,14 @@ preprocessing. The executable workflow can:
 - select either the non-drum `pretty_midi` instrument stream with the most
   notes or an explicit instrument index;
 - remove initial silence and optionally quantize note onsets and durations;
-- strip Guitar Pro's inert time-zero pitch-bend-range setup and collapse exact
-  duplicate unison notes while retaining strict checks for musical controls;
+- preserve expressive pitch-wheel curves after normalizing an explicit,
+  constant source sensitivity to the canonical +/-6-semitone range, while
+  removing neutral exporter bookkeeping and rejecting ambiguous curves;
+- load optional hash-linked `*.mid.techniques.json` sidecars for dead notes,
+  palm mute, slide direction, and vibrato, without treating an unannotated
+  legacy MIDI as a confirmed negative example;
+- collapse exact duplicate unison notes while retaining strict checks for
+  unsupported musical controls;
 - split material into configurable phrases of 2, 4, or 8 bars;
 - assign each source file to exactly one train, validation, or test split
   before creating phrases, grouping byte-identical sources to prevent
@@ -47,6 +53,9 @@ Stage 2 REMI tokenization is also implemented. It:
   the unpadded sequences;
 - validates every sequence with an encode/decode/re-encode round trip while
   retaining the MIDI instrument program as out-of-band metadata;
+- uses the local `GuitarREMI` vocabulary: native `PitchBend` events plus six
+  postfix technique tokens (`DEAD_NOTE`, palm-mute on/off, slide up/down, and
+  `VIBRATO`);
 - saves the complete tokenizer vocabulary and one JSON sequence per fragment,
   preserving the Stage 1 train/validation/test assignment; and
 - publishes content-derived immutable runs under `data/tokenized/runs/` plus
@@ -57,6 +66,9 @@ Stage 3 training is implemented as well. It:
 - builds strict autoregressive train and validation datasets only from the
   entries in the authoritative Stage 2 manifest, verifying their hashes and
   refusing to silently truncate sequences;
+- masks the post-`Duration` technique decision from loss for `UNLABELED`
+  sequences, so legacy files still teach notes and rhythm without becoming
+  false negative technique examples; `COMPLETE` examples remain fully trained;
 - shifts each sequence into input/next-token targets and pads each batch only
   to its longest member, using the reserved `PAD` token;
 - trains the configured two-layer GRU with AdamW and token-weighted
@@ -113,10 +125,14 @@ variation. The guitar program is stored beside the token IDs instead of in the
 REMI vocabulary, consistent with the one-track Stage 1 boundary.
 
 The current preprocessing boundary deliberately assumes one principal
-instrumental track, 4/4 meter, constant tempo per fragment, no pitch bends,
-and monophonic or modestly polyphonic material. The source file—not a derived
-phrase—is the unit of dataset splitting. Transposition never changes that
-source split.
+instrumental track, 4/4 meter, constant tempo per fragment, pitch bends with
+an explicitly declared and constant source sensitivity and actual excursions
+no wider than +/-6 semitones, and monophonic or modestly polyphonic material.
+Techniques that ordinary MIDI
+cannot distinguish use the optional strict sidecar contract documented in
+[`docs/technique-sidecars.md`](docs/technique-sidecars.md). The source
+file—not a derived phrase—is the unit of dataset splitting. Transposition
+never changes that source split.
 
 `track_number` in the manifest is retained to match the project requirement,
 but in Stage 1 it means the zero-based index in `pretty_midi.instruments`. It
@@ -213,6 +229,14 @@ service, or audio-model setup.
    repository root (the parent directory of `configs/`).
 3. Keep the source files private: Git ignores MIDI and all derived data.
 
+Legacy MIDI files without a sidecar remain valid and are recorded as
+`UNLABELED`; they teach notes and rhythm but do not provide technique targets.
+For reviewed material, add the sibling sidecar described in
+[`docs/technique-sidecars.md`](docs/technique-sidecars.md). A present empty
+`COMPLETE` sidecar explicitly means “reviewed and contains no supported
+techniques.” Keep the original Guitar Pro or MusicXML files as well: standard
+MIDI cannot reliably tell a slide from a bend or recover every articulation.
+
 The default pitch range is MIDI 21–108. Missing time-signature events may be
 treated as 4/4, but explicit non-4/4 events are rejected. Quantization is off
 by default; when enabled, `subdivisions_per_beat: 4` uses a sixteenth-note
@@ -266,12 +290,17 @@ data/tokenized/runs/<run_id>/
 data/tokenized/manifest.json       authoritative current-run manifest
 ```
 
-The current corpus contains 42 raw MIDI files: 38 were accepted and 4 rejected
-by the validation boundary. Preprocessing and transposition produced 759
-tokenized sequences: 744 train, 7 validation, and 8 test. The longest saved
-sequence—including `BOS` and `EOS`—has 352 tokens. Stage 2 does not truncate or
-pad these files; Stage 3 applies dynamic padding at batch time and the current
-384-token limit accommodates the whole corpus.
+The authoritative manifests report the live corpus size, accepted/rejected
+sources, split counts, technique coverage, bend-token counts, and sequence
+lengths. These values are intentionally not hard-coded here because `data/raw`
+is a growing private collection. Stage 2 never truncates or pads stored files;
+Stage 3 applies dynamic padding and rejects any sequence above the configured
+maximum instead of silently shortening it.
+
+The GuitarREMI vocabulary and schema differ from the earlier note-only
+baseline. Checkpoints trained against an older tokenization manifest are
+intentionally incompatible; preprocess, tokenize, and start a new training run
+after this migration.
 
 Train the GRU using the authoritative token manifest:
 
@@ -335,8 +364,15 @@ Empty or invalid decoded MIDI must not be saved.
 
 - Only one selected instrumental track is retained per source example.
 - The supported meter is 4/4 and tempo must remain constant within a source.
-- Non-neutral pitch bends, lyrics, audio, and guitar fingering are outside the
-  current scope; pitchwheel reset events at value zero are harmlessly removed.
+- Pitch bends require one explicit, constant source sensitivity and excursions
+  no wider than the canonical +/-6-semitone range. Missing or changing
+  sensitivity and wider actual excursions are rejected rather than guessed or
+  clipped.
+- Standard MIDI does not identify dead notes, palm mute, slide semantics, or
+  vibrato reliably. They require a `COMPLETE` sidecar. Version 1 learns slide
+  direction but intentionally does not tokenize its exact target pitch.
+- Lyrics, audio, tablature strings/frets, pick direction, and other guitar
+  fingering remain outside the current language.
 - Rhythm augmentation is not implemented.
 - Simple polyphony is accepted, but complex multi-track arrangement semantics
   are not preserved.
@@ -344,8 +380,8 @@ Empty or invalid decoded MIDI must not be saved.
   events for the same pitch/channel and dangling notes remain rejected because
   their Standard MIDI File interpretation is ambiguous.
 - Control changes are rejected rather than silently discarded, except for the
-  exact time-zero pitch-bend-range RPN emitted by Guitar Pro; sustain-pedal
-  rendering is not implemented yet.
+  validated pitch-bend-sensitivity RPN; sustain-pedal rendering is not
+  implemented yet.
 - Final phrase completeness is measured with the source End-of-Track duration,
   and generated phrase files preserve trailing rests up to their nominal
   2/4/8-bar boundary.
@@ -360,7 +396,8 @@ Empty or invalid decoded MIDI must not be saved.
 1. **Done:** structure, configuration, inspection, preprocessing, manifest,
    leakage-safe source splits, transposition, and critical Stage 1 tests.
 2. **Done:** data-driven REMI tokenization with MidiTok, explicit `PAD`/`BOS`/
-   `EOS`, token round-trip validation, immutable token runs, and Stage 2 tests.
+   `EOS`, native pitch bends, the first guitar-technique token language, token
+   round-trip validation, immutable token runs, and Stage 2 tests.
 3. **Done:** strict autoregressive datasets and dynamic padding.
 4. **Done:** compact GRU, CPU/CUDA training, validation, gradient clipping,
    compatible exact resume, atomic checkpoints, early stopping, reports, and
@@ -409,9 +446,14 @@ preprocesamiento básico. El flujo ejecutable permite:
 - seleccionar el flujo instrumental no percusivo de `pretty_midi` con más
   notas o un índice de instrumento explícito;
 - eliminar el silencio inicial y cuantizar opcionalmente inicios y duraciones;
-- quitar la configuración inerte de rango de pitch bend que Guitar Pro escribe
-  al inicio y colapsar unísonos duplicados exactos, manteniendo controles
-  estrictos para eventos musicales;
+- conservar curvas expresivas de pitch bend normalizando una sensibilidad
+  fuente explícita y constante al rango canónico de +/-6 semitonos, eliminando
+  solo bookkeeping neutro y rechazando curvas ambiguas;
+- cargar sidecars opcionales `*.mid.techniques.json`, ligados por hash, para
+  notas muertas, palm mute, dirección de slide y vibrato, sin interpretar un
+  MIDI antiguo no anotado como ejemplo negativo confirmado;
+- colapsar unísonos duplicados exactos y mantener controles estrictos para
+  eventos musicales no soportados;
 - dividir el material en frases configurables de 2, 4 u 8 compases;
 - asignar cada archivo fuente a un único split de entrenamiento, validación o
   prueba antes de fragmentarlo y agrupar fuentes idénticas byte a byte para
@@ -431,6 +473,8 @@ La tokenización REMI de la Etapa 2 también está implementada. Esta etapa:
   dentro de las secuencias aún no rellenadas;
 - valida cada secuencia mediante codificación/decodificación/recodificación y
   conserva el programa del instrumento MIDI como metadata fuera del stream;
+- usa el vocabulario local `GuitarREMI`: eventos `PitchBend` nativos y seis
+  tokens postfix (`DEAD_NOTE`, palm mute on/off, slide up/down y `VIBRATO`);
 - guarda el vocabulario completo y una secuencia JSON por fragmento sin cambiar
   su asignación a entrenamiento, validación o prueba; y
 - publica corridas inmutables derivadas del contenido en
@@ -442,6 +486,10 @@ El entrenamiento de la Etapa 3 también está implementado. Esta etapa:
 - construye datasets autorregresivos estrictos de entrenamiento y validación
   únicamente desde las entradas del manifiesto autoritativo de la Etapa 2,
   verifica sus hashes y nunca trunca secuencias silenciosamente;
+- excluye de la pérdida la decisión técnica posterior a `Duration` en
+  secuencias `UNLABELED`, de modo que los archivos antiguos enseñen notas y
+  ritmo sin convertirse en falsos negativos; los ejemplos `COMPLETE` sí se
+  entrenan íntegramente;
 - desplaza cada secuencia para formar pares entrada/token siguiente y rellena
   cada batch solo hasta su miembro más largo, usando el token `PAD` reservado;
 - entrena la GRU configurada de dos capas con AdamW, cross-entropy ponderada por
@@ -501,9 +549,13 @@ dentro del vocabulario REMI, de acuerdo con el límite de una sola pista de la
 Etapa 1.
 
 El límite actual asume una pista instrumental principal, compás 4/4, tempo
-constante por fragmento, ausencia de pitch bends y material monofónico o con
-polifonía sencilla. La unidad para dividir el dataset es el archivo fuente, no
-la frase derivada. La transposición nunca cambia el split de origen.
+constante por fragmento, pitch bends con sensibilidad fuente explícita y
+constante cuya excursión real no supere +/-6 semitonos, y material monofónico
+o con polifonía sencilla. Las técnicas
+que un MIDI común no puede distinguir usan el contrato opcional y estricto de
+[`docs/technique-sidecars.md`](docs/technique-sidecars.md). La unidad para
+dividir el dataset es el archivo fuente, no la frase derivada. La transposición
+nunca cambia el split de origen.
 
 El campo `track_number` se conserva en el manifiesto para cumplir el contrato
 del proyecto, pero en esta etapa significa el índice base cero dentro de
@@ -604,6 +656,15 @@ escritorio, base de datos, servicios cloud ni modelos de audio.
 3. Mantén privadas las fuentes: Git ignora los MIDI y todos los datos
    derivados.
 
+Los MIDIs antiguos sin sidecar siguen siendo válidos y quedan registrados como
+`UNLABELED`: enseñan notas y ritmo, pero no aportan objetivos de técnicas. Para
+material revisado, agrega el sidecar hermano descrito en
+[`docs/technique-sidecars.md`](docs/technique-sidecars.md). Un sidecar
+`COMPLETE` presente y vacío significa explícitamente «revisado y sin técnicas
+soportadas». Conserva además los originales Guitar Pro o MusicXML: el MIDI
+estándar no permite distinguir de forma fiable un slide de un bend ni recuperar
+todas las articulaciones.
+
 El rango predeterminado es MIDI 21–108. Los eventos de compás ausentes pueden
 interpretarse como 4/4, pero se rechazan eventos explícitos distintos de 4/4.
 La cuantización está desactivada por defecto; al activarla,
@@ -658,13 +719,17 @@ data/tokenized/runs/<run_id>/
 data/tokenized/manifest.json       manifiesto autoritativo de la corrida actual
 ```
 
-El corpus actual contiene 42 archivos MIDI raw: 38 fueron aceptados y 4
-rechazados por el límite de validación. El preprocesamiento y la transposición
-produjeron 759 secuencias tokenizadas: 744 de entrenamiento, 7 de validación y
-8 de prueba. La secuencia guardada más larga —incluidos `BOS` y `EOS`— tiene
-352 tokens. La Etapa 2 no trunca ni rellena estos archivos; la Etapa 3 aplica
-padding dinámico al formar cada batch y el límite actual de 384 tokens contiene
-todo el corpus.
+Los manifiestos autoritativos informan el tamaño vivo del corpus, fuentes
+aceptadas/rechazadas, splits, cobertura de técnicas, tokens de bends y longitudes
+de secuencia. Esos valores no se fijan aquí porque `data/raw` es una colección
+privada en crecimiento. La Etapa 2 nunca trunca ni rellena los archivos
+guardados; la Etapa 3 aplica padding dinámico y rechaza una secuencia que exceda
+el máximo configurado, en vez de acortarla silenciosamente.
+
+El vocabulario y schema GuitarREMI son distintos del baseline anterior de solo
+notas. Los checkpoints entrenados con un manifiesto de tokenización antiguo son
+deliberadamente incompatibles: después de esta migración hay que preprocesar,
+tokenizar e iniciar un entrenamiento nuevo.
 
 Entrena la GRU desde el manifiesto autoritativo de tokens:
 
@@ -731,8 +796,15 @@ repetición. No deberán guardarse MIDIs vacíos o inválidos.
 
 - Se conserva una sola pista instrumental por ejemplo fuente.
 - Solo se admite compás 4/4 y el tempo debe ser constante.
-- Pitch bends no neutros, letras, audio y digitaciones de guitarra quedan fuera
-  del alcance actual; los resets de pitchwheel con valor cero se eliminan.
+- Los pitch bends requieren una sensibilidad fuente explícita y constante y
+  una excursión no mayor que el rango canónico de +/-6 semitonos. Una
+  sensibilidad ausente o cambiante y las excursiones reales más amplias se
+  rechazan: no se adivinan ni recortan.
+- El MIDI estándar no identifica de forma fiable notas muertas, palm mute,
+  semántica de slide o vibrato; requieren un sidecar `COMPLETE`. La versión 1
+  aprende la dirección del slide, pero no tokeniza su pitch destino exacto.
+- Letras, audio, cuerdas/trastes de tablatura, dirección de púa y otras
+  digitaciones siguen fuera del lenguaje actual.
 - El aumento rítmico no está implementado.
 - Se acepta polifonía sencilla, pero no se conserva la semántica de arreglos
   multipista complejos.
@@ -740,8 +812,8 @@ repetición. No deberán guardarse MIDIs vacíos o inválidos.
   idénticos superpuestos del mismo pitch/canal y notas colgantes, porque su
   interpretación en Standard MIDI File es ambigua.
 - Los control changes se rechazan en vez de descartarlos silenciosamente, salvo
-  el RPN exacto de rango de pitch bend que Guitar Pro escribe al inicio; aún no
-  se renderiza el pedal de sustain.
+  el RPN validado de sensibilidad de pitch bend; aún no se renderiza el pedal
+  de sustain.
 - La completitud de la última frase usa la duración End-of-Track de la fuente y
   los fragmentos preservan silencios finales hasta el límite nominal de 2/4/8
   compases.
@@ -759,8 +831,9 @@ repetición. No deberán guardarse MIDIs vacíos o inválidos.
    manifiesto, splits por fuente sin leakage, transposición y tests críticos de
    la Etapa 1.
 2. **Hecho:** tokenización REMI basada en los datos con MidiTok, `PAD`/`BOS`/
-   `EOS` explícitos, validación de ida y vuelta, corridas inmutables de tokens y
-   tests de la Etapa 2.
+   `EOS` explícitos, pitch bends nativos, el primer lenguaje de tokens de
+   técnicas de guitarra, validación de ida y vuelta, corridas inmutables de
+   tokens y tests de la Etapa 2.
 3. **Hecho:** datasets autorregresivos estrictos y padding dinámico.
 4. **Hecho:** GRU compacta, entrenamiento CPU/CUDA, validación, gradient
    clipping, reanudación exacta y compatible, checkpoints atómicos, early

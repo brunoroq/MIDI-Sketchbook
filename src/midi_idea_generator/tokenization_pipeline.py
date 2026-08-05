@@ -15,22 +15,33 @@ import tempfile
 from typing import Any, Mapping, Never, Sequence
 
 from . import __version__
-from .tokenization_config import TokenizationConfig
+from .tokenization_config import (
+    PITCH_BEND_SENSITIVITY_SEMITONES,
+    TokenizationConfig,
+)
 from .tokenizer import (
+    TECHNIQUE_TYPES,
     EncodedMidi,
+    TechniqueAnnotation,
     TokenizationError,
     build_tokenizer,
     encode_midi,
     get_special_token_ids,
+    get_technique_token_ids,
     load_tokenizer,
     save_tokenizer,
 )
 from .utils import relative_label, write_json
 
 
-TOKENIZATION_SCHEMA_VERSION = 1
-SEQUENCE_SCHEMA_VERSION = 1
+TOKENIZATION_SCHEMA_VERSION = 2
+SEQUENCE_SCHEMA_VERSION = 2
+PREPROCESSING_SCHEMA_VERSION = 3
 _SPLITS = ("train", "validation", "test")
+_TECHNIQUE_COVERAGE = ("UNLABELED", "COMPLETE")
+_TECHNIQUE_ORDER = {
+    technique_type: index for index, technique_type in enumerate(TECHNIQUE_TYPES)
+}
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{20}$")
 
@@ -61,6 +72,15 @@ class FragmentSpec:
     output_file: str
     path: Path
     num_notes: int
+    num_pitch_bend_events: int
+    num_expressive_pitch_bend_events: int
+    pitch_bend_range_semitones: int | None
+    synthetic_initial_pitch_bend: bool
+    synthetic_final_pitch_bend_reset: bool
+    output_sha256: str
+    output_size_bytes: int
+    technique_coverage: str
+    techniques: tuple[TechniqueAnnotation, ...]
     nominal_duration_seconds: float
     actual_note_duration_seconds: float
 
@@ -103,7 +123,10 @@ def run_tokenization(config: TokenizationConfig) -> TokenizationReport:
         config.paths.preprocessing_manifest_path, config.project_root
     )
     input_fingerprints = {
-        fragment.path: _fingerprint_file(fragment.path)
+        fragment.path: FileFingerprint(
+            sha256=fragment.output_sha256,
+            size_bytes=fragment.output_size_bytes,
+        )
         for fragment in preprocessing.fragments
     }
     configuration = _configuration_snapshot(config)
@@ -142,6 +165,10 @@ def run_tokenization(config: TokenizationConfig) -> TokenizationReport:
             raise TokenizationPipelineError(
                 "Reloading tokenizer.json changed the special-token IDs."
             )
+        if get_technique_token_ids(restored) != get_technique_token_ids(tokenizer):
+            raise TokenizationPipelineError(
+                "Reloading tokenizer.json changed the technique-token IDs."
+            )
         # Encode with the reloaded artifact itself.  This makes the tokenizer
         # published for Stage 3 the exact implementation exercised here.
         tokenizer = restored
@@ -163,6 +190,7 @@ def run_tokenization(config: TokenizationConfig) -> TokenizationReport:
         _verify_unchanged_inputs(preprocessing, input_fingerprints)
         tokenizer_fingerprint = _fingerprint_file(staged_tokenizer_path)
         special_ids = get_special_token_ids(tokenizer)
+        technique_ids = get_technique_token_ids(tokenizer)
         manifest = {
             "schema_version": TOKENIZATION_SCHEMA_VERSION,
             "tokenization_run_id": run_id,
@@ -172,7 +200,7 @@ def run_tokenization(config: TokenizationConfig) -> TokenizationReport:
                     preprocessing.path, config.project_root
                 ),
                 "manifest_sha256": preprocessing.fingerprint.sha256,
-                "schema_version": 2,
+                "schema_version": PREPROCESSING_SCHEMA_VERSION,
                 "run_id": preprocessing.run_id,
                 "configuration_sha256": preprocessing.configuration_sha256,
             },
@@ -180,7 +208,7 @@ def run_tokenization(config: TokenizationConfig) -> TokenizationReport:
             "configuration": configuration,
             "tool_versions": tool_versions,
             "tokenizer": {
-                "type": "REMI",
+                "type": "GuitarREMI",
                 "path": relative_label(
                     final_run_dir / "tokenizer.json", config.project_root
                 ),
@@ -193,6 +221,10 @@ def run_tokenization(config: TokenizationConfig) -> TokenizationReport:
                     "bos": special_ids.bos,
                     "eos": special_ids.eos,
                 },
+                "technique_token_ids": technique_ids,
+                "pitch_bend_sensitivity_semitones": (
+                    PITCH_BEND_SENSITIVITY_SEMITONES
+                ),
             },
             "summary": _summarize_sequences(sequence_records),
             "sequences": sequence_records,
@@ -258,9 +290,13 @@ def _load_preprocessing_manifest(path: Path, project_root: Path) -> Preprocessin
         "fragments",
     }
     _reject_unknown_keys(root, allowed_root, "Stage 1 manifest")
-    if _require_int(root.get("schema_version"), "schema_version") != 2:
+    if (
+        _require_int(root.get("schema_version"), "schema_version")
+        != PREPROCESSING_SCHEMA_VERSION
+    ):
         raise TokenizationPipelineError(
-            "Stage 2 requires a Stage 1 manifest with schema_version 2."
+            "Stage 2 requires a Stage 1 manifest with schema_version "
+            f"{PREPROCESSING_SCHEMA_VERSION}."
         )
     run_id = _require_string(root.get("run_id"), "run_id")
     if not _RUN_ID_PATTERN.fullmatch(run_id):
@@ -410,6 +446,15 @@ def _validate_fragment(
         "transpose_semitones",
         "output_file",
         "num_notes",
+        "num_pitch_bend_events",
+        "num_expressive_pitch_bend_events",
+        "pitch_bend_range_semitones",
+        "synthetic_initial_pitch_bend",
+        "synthetic_final_pitch_bend_reset",
+        "output_sha256",
+        "output_size_bytes",
+        "technique_coverage",
+        "techniques",
         "nominal_duration_seconds",
         "actual_note_duration_seconds",
     }
@@ -459,6 +504,60 @@ def _validate_fragment(
     num_notes = _require_int(fragment["num_notes"], f"{name}.num_notes")
     if num_notes <= 0:
         raise TokenizationPipelineError(f"{name}.num_notes must be positive.")
+    num_pitch_bend_events = _require_nonnegative_int(
+        fragment["num_pitch_bend_events"], f"{name}.num_pitch_bend_events"
+    )
+    num_expressive_pitch_bend_events = _require_nonnegative_int(
+        fragment["num_expressive_pitch_bend_events"],
+        f"{name}.num_expressive_pitch_bend_events",
+    )
+    if num_expressive_pitch_bend_events > num_pitch_bend_events:
+        raise TokenizationPipelineError(
+            f"{name}.num_expressive_pitch_bend_events cannot exceed "
+            "num_pitch_bend_events."
+        )
+    raw_bend_range = fragment["pitch_bend_range_semitones"]
+    if raw_bend_range is None:
+        pitch_bend_range_semitones = None
+    else:
+        pitch_bend_range_semitones = _require_positive_int(
+            raw_bend_range, f"{name}.pitch_bend_range_semitones"
+        )
+    if num_expressive_pitch_bend_events:
+        if pitch_bend_range_semitones != PITCH_BEND_SENSITIVITY_SEMITONES:
+            raise TokenizationPipelineError(
+                f"{name}.pitch_bend_range_semitones must be "
+                f"{PITCH_BEND_SENSITIVITY_SEMITONES} when expressive pitch "
+                "bends are present."
+            )
+    elif pitch_bend_range_semitones is not None:
+        raise TokenizationPipelineError(
+            f"{name}.pitch_bend_range_semitones must be null when no "
+            "expressive pitch bends are present."
+        )
+    synthetic_initial_pitch_bend = _require_bool(
+        fragment["synthetic_initial_pitch_bend"],
+        f"{name}.synthetic_initial_pitch_bend",
+    )
+    synthetic_final_pitch_bend_reset = _require_bool(
+        fragment["synthetic_final_pitch_bend_reset"],
+        f"{name}.synthetic_final_pitch_bend_reset",
+    )
+    output_sha256 = _require_sha256(
+        fragment["output_sha256"], f"{name}.output_sha256"
+    )
+    output_size_bytes = _require_positive_int(
+        fragment["output_size_bytes"], f"{name}.output_size_bytes"
+    )
+    technique_coverage = _require_technique_coverage(
+        fragment["technique_coverage"], f"{name}.technique_coverage"
+    )
+    techniques = _require_techniques(
+        fragment["techniques"],
+        f"{name}.techniques",
+        num_notes=num_notes,
+        coverage=technique_coverage,
+    )
     nominal_duration = _require_positive_number(
         fragment["nominal_duration_seconds"], f"{name}.nominal_duration_seconds"
     )
@@ -500,6 +599,15 @@ def _validate_fragment(
         raise TokenizationPipelineError(
             f"Declared fragment does not exist or is not a regular file: {output_path}"
         )
+    actual_fingerprint = _fingerprint_file(output_path)
+    declared_fingerprint = FileFingerprint(
+        sha256=output_sha256, size_bytes=output_size_bytes
+    )
+    if actual_fingerprint != declared_fingerprint:
+        raise TokenizationPipelineError(
+            f"{name} output_sha256/output_size_bytes do not match the "
+            "declared fragment file."
+        )
     return FragmentSpec(
         source_file=source_file,
         source_sha256=source_sha256,
@@ -511,6 +619,15 @@ def _validate_fragment(
         output_file=output_file,
         path=output_path,
         num_notes=num_notes,
+        num_pitch_bend_events=num_pitch_bend_events,
+        num_expressive_pitch_bend_events=num_expressive_pitch_bend_events,
+        pitch_bend_range_semitones=pitch_bend_range_semitones,
+        synthetic_initial_pitch_bend=synthetic_initial_pitch_bend,
+        synthetic_final_pitch_bend_reset=synthetic_final_pitch_bend_reset,
+        output_sha256=output_sha256,
+        output_size_bytes=output_size_bytes,
+        technique_coverage=technique_coverage,
+        techniques=techniques,
         nominal_duration_seconds=nominal_duration,
         actual_note_duration_seconds=actual_duration,
     )
@@ -534,7 +651,9 @@ def _tokenize_fragments(
                 raise TokenizationPipelineError(
                     "input changed before it was tokenized"
                 )
-            encoded = encode_midi(tokenizer, fragment.path)
+            encoded = encode_midi(
+                tokenizer, fragment.path, techniques=fragment.techniques
+            )
             if _fingerprint_file(fragment.path) != expected:
                 raise TokenizationPipelineError(
                     "input changed while it was tokenized"
@@ -552,7 +671,7 @@ def _tokenize_fragments(
             seen_sequence_ids.add(sequence_id)
             staged_sequence_path = staging_dir / fragment.split / f"{sequence_id}.json"
             final_sequence_path = final_run_dir / fragment.split / f"{sequence_id}.json"
-            sequence_payload = _sequence_payload(sequence_id, encoded)
+            sequence_payload = _sequence_payload(sequence_id, encoded, fragment)
             write_json(staged_sequence_path, sequence_payload)
             output_fingerprint = _fingerprint_file(staged_sequence_path)
             records.append(
@@ -577,6 +696,10 @@ def _tokenize_fragments(
                     "num_notes": encoded.num_notes,
                     "num_tokens": encoded.num_tokens,
                     "num_musical_tokens": encoded.num_musical_tokens,
+                    "technique_coverage": fragment.technique_coverage,
+                    "techniques": _techniques_payload(encoded.techniques),
+                    "num_technique_tokens": len(encoded.techniques),
+                    "num_pitch_bend_tokens": encoded.num_pitch_bends,
                     "nominal_duration_seconds": fragment.nominal_duration_seconds,
                     "actual_note_duration_seconds": fragment.actual_note_duration_seconds,
                     "token_error_ratio": encoded.token_error_ratio,
@@ -588,12 +711,16 @@ def _tokenize_fragments(
     return records, failures
 
 
-def _sequence_payload(sequence_id: str, encoded: EncodedMidi) -> dict[str, Any]:
+def _sequence_payload(
+    sequence_id: str, encoded: EncodedMidi, fragment: FragmentSpec
+) -> dict[str, Any]:
     return {
         "schema_version": SEQUENCE_SCHEMA_VERSION,
         "sequence_id": sequence_id,
         "ids": list(encoded.ids),
         "programs": [list(program) for program in encoded.programs],
+        "technique_coverage": fragment.technique_coverage,
+        "techniques": _techniques_payload(encoded.techniques),
     }
 
 
@@ -601,10 +728,24 @@ def _sequence_id(fragment: FragmentSpec, fingerprint: FileFingerprint) -> str:
     stem = Path(fragment.output_file).stem
     slug = re.sub(r"[^A-Za-z0-9_-]+", "-", stem).strip("-_").lower()
     slug = slug[:64] or "sequence"
-    digest = hashlib.sha256(
-        f"{fragment.output_file}\0{fingerprint.sha256}".encode("utf-8")
-    ).hexdigest()[:12]
+    digest = _canonical_hash(
+        {
+            "output_file": fragment.output_file,
+            "sha256": fingerprint.sha256,
+            "technique_coverage": fragment.technique_coverage,
+            "techniques": _techniques_payload(fragment.techniques),
+        }
+    )[:12]
     return f"{slug}-{digest}"
+
+
+def _techniques_payload(
+    techniques: Sequence[TechniqueAnnotation],
+) -> list[dict[str, Any]]:
+    return [
+        {"type": technique.type, "note_index": technique.note_index}
+        for technique in techniques
+    ]
 
 
 def _configuration_snapshot(config: TokenizationConfig) -> dict[str, Any]:
@@ -682,6 +823,19 @@ def _summarize_sequences(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]
         }
 
     all_summary = group_summary(records)
+    technique_counts = {technique_type: 0 for technique_type in TECHNIQUE_TYPES}
+    for record in records:
+        for technique in record["techniques"]:
+            technique_counts[str(technique["type"])] += 1
+    complete_sequences = sum(
+        record["technique_coverage"] == "COMPLETE" for record in records
+    )
+    unlabeled_sequences = sum(
+        record["technique_coverage"] == "UNLABELED" for record in records
+    )
+    total_pitch_bends = sum(
+        int(record["num_pitch_bend_tokens"]) for record in records
+    )
     return {
         "sequences": all_summary["sequences"],
         "total_tokens": all_summary["total_tokens"],
@@ -696,6 +850,20 @@ def _summarize_sequences(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]
                 [record for record in records if record["split"] == split]
             )
             for split in _SPLITS
+        },
+        "techniques": {
+            "total_tokens": sum(technique_counts.values()),
+            "by_type": technique_counts,
+            "coverage": {
+                "complete_sequences": complete_sequences,
+                "unlabeled_sequences": unlabeled_sequences,
+            },
+        },
+        "pitch_bends": {
+            "total_tokens": total_pitch_bends,
+            "sequences_with_pitch_bends": sum(
+                int(record["num_pitch_bend_tokens"]) > 0 for record in records
+            ),
         },
     }
 
@@ -849,6 +1017,13 @@ def _require_nonnegative_int(value: object, name: str) -> int:
     return converted
 
 
+def _require_positive_int(value: object, name: str) -> int:
+    converted = _require_int(value, name)
+    if converted <= 0:
+        raise TokenizationPipelineError(f"{name} must be positive.")
+    return converted
+
+
 def _require_positive_number(value: object, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TokenizationPipelineError(f"{name} must be a number.")
@@ -865,6 +1040,80 @@ def _require_split(value: object, name: str) -> str:
             f"{name} must be train, validation, or test."
         )
     return split
+
+
+def _require_technique_coverage(value: object, name: str) -> str:
+    coverage = _require_string(value, name)
+    if coverage not in _TECHNIQUE_COVERAGE:
+        raise TokenizationPipelineError(
+            f"{name} must be UNLABELED or COMPLETE."
+        )
+    return coverage
+
+
+def _require_techniques(
+    value: object,
+    name: str,
+    *,
+    num_notes: int,
+    coverage: str,
+) -> tuple[TechniqueAnnotation, ...]:
+    if not isinstance(value, list):
+        raise TokenizationPipelineError(f"{name} must be a JSON list.")
+
+    techniques: list[TechniqueAnnotation] = []
+    identities: set[tuple[int, str]] = set()
+    for index, raw_technique in enumerate(value):
+        item_name = f"{name}[{index}]"
+        technique = _require_mapping(raw_technique, item_name)
+        allowed = {"type", "note_index"}
+        _reject_unknown_keys(technique, allowed, item_name)
+        missing = sorted(allowed - set(technique))
+        if missing:
+            raise TokenizationPipelineError(
+                f"Missing field(s) in {item_name}: {', '.join(missing)}."
+            )
+        technique_type = _require_string(
+            technique["type"], f"{item_name}.type"
+        )
+        if technique_type not in _TECHNIQUE_ORDER:
+            raise TokenizationPipelineError(
+                f"{item_name}.type must be one of {', '.join(TECHNIQUE_TYPES)}."
+            )
+        note_index = _require_nonnegative_int(
+            technique["note_index"], f"{item_name}.note_index"
+        )
+        if note_index >= num_notes:
+            raise TokenizationPipelineError(
+                f"{item_name}.note_index {note_index} is outside the "
+                f"{num_notes}-note fragment."
+            )
+        identity = (note_index, technique_type)
+        if identity in identities:
+            raise TokenizationPipelineError(
+                f"Duplicate technique {technique_type} for note {note_index} "
+                f"in {name}."
+            )
+        identities.add(identity)
+        techniques.append(
+            TechniqueAnnotation(type=technique_type, note_index=note_index)
+        )
+
+    canonical = tuple(
+        sorted(
+            techniques,
+            key=lambda item: (item.note_index, _TECHNIQUE_ORDER[item.type]),
+        )
+    )
+    if tuple(techniques) != canonical:
+        raise TokenizationPipelineError(
+            f"{name} must use canonical note-index and technique-type order."
+        )
+    if coverage == "UNLABELED" and canonical:
+        raise TokenizationPipelineError(
+            f"{name} must be empty when technique_coverage is UNLABELED."
+        )
+    return canonical
 
 
 def _require_sha256(value: object, name: str) -> str:

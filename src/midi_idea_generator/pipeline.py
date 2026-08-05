@@ -29,15 +29,30 @@ from .midi_io import (
     write_midi,
 )
 from .preprocessing import (
+    PitchBendNormalizationError,
     QuantizationCollisionError,
     normalize_instrument,
     split_instrument_into_phrases,
 )
 from .splitting import assign_source_splits
+from .technique_processing import (
+    TECHNIQUE_COVERAGE_COMPLETE,
+    TECHNIQUE_COVERAGE_UNLABELED,
+    TechniqueProjectionError,
+    project_phrase_techniques,
+    source_technique_counts,
+)
+from .techniques import (
+    SIDECAR_SUFFIX,
+    TechniqueSidecar,
+    TechniqueSidecarError,
+    load_technique_sidecar,
+    sidecar_path_for,
+)
 from .utils import relative_label, write_json
 
 LOGGER = logging.getLogger(__name__)
-PIPELINE_SCHEMA_VERSION = 2
+PIPELINE_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +61,15 @@ class SourceFingerprint:
 
     sha256: str
     size_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class TechniqueSidecarInput:
+    """Captured optional-sidecar state used for reproducibility checks."""
+
+    path: Path
+    present: bool
+    fingerprint: SourceFingerprint | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +120,9 @@ def _source_record(
     split: str | None,
     fingerprint: SourceFingerprint | None,
     content_group_size: int,
+    canonical_pitch_bend_range_semitones: int,
+    sidecar_input: TechniqueSidecarInput,
+    sidecar_label: str,
 ) -> dict[str, Any]:
     track = (
         inspection.tracks[inspection.selected_track]
@@ -123,6 +150,36 @@ def _source_record(
         "duplicate_notes_collapsed": (
             track.duplicate_notes_collapsed if track else None
         ),
+        "num_pitch_bend_events": track.num_pitch_bend_events if track else None,
+        "num_expressive_pitch_bend_events": (
+            track.num_expressive_pitch_bend_events if track else None
+        ),
+        "source_pitch_bend_range_semitones": (
+            track.source_pitch_bend_range_semitones if track else None
+        ),
+        "canonical_pitch_bend_range_semitones": (
+            canonical_pitch_bend_range_semitones
+            if track and track.has_pitch_bends
+            else None
+        ),
+        "technique_sidecar": sidecar_label if sidecar_input.present else None,
+        "technique_sidecar_sha256": (
+            sidecar_input.fingerprint.sha256
+            if sidecar_input.fingerprint is not None
+            else None
+        ),
+        "technique_sidecar_size_bytes": (
+            sidecar_input.fingerprint.size_bytes
+            if sidecar_input.fingerprint is not None
+            else None
+        ),
+        "technique_coverage": (
+            None if sidecar_input.present else TECHNIQUE_COVERAGE_UNLABELED
+        ),
+        "technique_note_count": 0,
+        "technique_annotation_count": 0,
+        "technique_counts": source_technique_counts(None),
+        "palm_mute_range_count": 0,
         "num_base_fragments": 0,
         "num_fragments_generated": 0,
         "compatible": inspection.compatible,
@@ -162,6 +219,70 @@ def _try_fingerprint(path: Path) -> SourceFingerprint | None:
     except OSError as exc:
         LOGGER.warning("Could not fingerprint source %s: %s", path, exc)
         return None
+
+
+def _capture_sidecar_input(midi_path: Path) -> TechniqueSidecarInput:
+    path = sidecar_path_for(midi_path)
+    present = path.exists() or path.is_symlink()
+    return TechniqueSidecarInput(
+        path=path,
+        present=present,
+        fingerprint=_try_fingerprint(path) if present else None,
+    )
+
+
+def _validate_no_orphan_sidecars(input_dir: Path, midi_files: list[Path]) -> None:
+    known_midis = set(midi_files)
+    for path in sorted(input_dir.rglob(f"*{SIDECAR_SUFFIX}")):
+        if not (path.is_file() or path.is_symlink()):
+            continue
+        midi_name = path.name[: -len(SIDECAR_SUFFIX)]
+        expected_midi = path.with_name(midi_name)
+        if (
+            expected_midi not in known_midis
+            or expected_midi.is_symlink()
+            or not expected_midi.is_file()
+        ):
+            raise TechniqueSidecarError(
+                "Orphan technique sidecar has no discovered sibling MIDI: "
+                f"{path}"
+            )
+
+
+def _populate_sidecar_record(
+    record: dict[str, Any], sidecar: TechniqueSidecar | None
+) -> None:
+    if sidecar is None:
+        record["technique_coverage"] = TECHNIQUE_COVERAGE_UNLABELED
+        return
+    counts = source_technique_counts(sidecar)
+    record["technique_coverage"] = TECHNIQUE_COVERAGE_COMPLETE
+    record["technique_note_count"] = len(sidecar.note_techniques)
+    record["technique_annotation_count"] = sum(counts.values())
+    record["technique_counts"] = counts
+    record["palm_mute_range_count"] = len(sidecar.palm_mute_ranges)
+
+
+def _verify_captured_inputs(
+    fingerprints: dict[Path, SourceFingerprint | None],
+    sidecar_inputs: dict[Path, TechniqueSidecarInput],
+) -> None:
+    changed_sources = [
+        path
+        for path, expected in fingerprints.items()
+        if _try_fingerprint(path) != expected
+    ]
+    changed_sidecars = [
+        path
+        for path, expected in sidecar_inputs.items()
+        if _capture_sidecar_input(path) != expected
+    ]
+    if changed_sources or changed_sidecars:
+        labels = [path.name for path in (*changed_sources, *changed_sidecars)][:5]
+        raise RuntimeError(
+            "Raw MIDI or technique sidecar changed before publication: "
+            + ", ".join(labels)
+        )
 
 
 def _config_snapshot(config: PreprocessConfig) -> dict[str, Any]:
@@ -209,12 +330,26 @@ def _make_run_id(
     config_sha256: str,
     labels: dict[Path, str],
     fingerprints: dict[Path, SourceFingerprint | None],
+    sidecar_inputs: dict[Path, TechniqueSidecarInput],
     versions: dict[str, str],
 ) -> str:
     sources = [
         {
             "source_file": labels[path],
             "sha256": fingerprint.sha256 if fingerprint else None,
+            "technique_sidecar": {
+                "present": sidecar_inputs[path].present,
+                "sha256": (
+                    sidecar_inputs[path].fingerprint.sha256
+                    if sidecar_inputs[path].fingerprint is not None
+                    else None
+                ),
+                "size_bytes": (
+                    sidecar_inputs[path].fingerprint.size_bytes
+                    if sidecar_inputs[path].fingerprint is not None
+                    else None
+                ),
+            },
         }
         for path, fingerprint in sorted(
             fingerprints.items(), key=lambda item: labels[item[0]]
@@ -283,6 +418,7 @@ def _process_sources(
     labels: dict[Path, str],
     assignments: dict[str, str],
     fingerprints: dict[Path, SourceFingerprint | None],
+    sidecar_inputs: dict[Path, TechniqueSidecarInput],
     content_group_sizes: dict[Path, int],
     changed_sources: set[Path],
     staging_dir: Path,
@@ -295,12 +431,16 @@ def _process_sources(
         source_label = labels[inspection.source_file]
         split = assignments.get(source_label)
         expected_fingerprint = fingerprints[inspection.source_file]
+        expected_sidecar = sidecar_inputs[inspection.source_file]
         record = _source_record(
             inspection,
             source_label,
             split,
             expected_fingerprint,
             content_group_sizes.get(inspection.source_file, 1),
+            config.validation.canonical_pitch_bend_range_semitones,
+            expected_sidecar,
+            f"{source_label}{SIDECAR_SUFFIX}",
         )
         source_records.append(record)
         if inspection.source_file in changed_sources:
@@ -319,6 +459,7 @@ def _process_sources(
             _mark_discarded(record, reason)
             LOGGER.warning("Discarded %s: %s", source_label, reason)
             continue
+
         try:
             midi = read_midi(inspection.source_file)
         except (MidiReadError, UnsupportedMidiError) as exc:
@@ -330,6 +471,39 @@ def _process_sources(
             _mark_discarded(record, reason)
             LOGGER.warning("Discarded %s: %s", source_label, reason)
             continue
+        try:
+            assert expected_fingerprint is not None
+            sidecar = load_technique_sidecar(
+                inspection.source_file,
+                source_sha256=expected_fingerprint.sha256,
+                midi=midi,
+                instrument_index=inspection.selected_track,
+            )
+        except TechniqueSidecarError as exc:
+            reason = f"Invalid technique sidecar: {exc}"
+            _mark_discarded(record, reason)
+            LOGGER.warning("Discarded %s: %s", source_label, reason)
+            continue
+        loaded_sidecar_fingerprint = (
+            SourceFingerprint(sidecar.sha256, sidecar.size_bytes)
+            if sidecar is not None
+            else None
+        )
+        if (
+            expected_sidecar.present != (sidecar is not None)
+            or expected_sidecar.fingerprint != loaded_sidecar_fingerprint
+        ):
+            reason = "Technique sidecar changed while it was being loaded"
+            _mark_discarded(record, reason)
+            LOGGER.warning("Discarded %s: %s", source_label, reason)
+            continue
+        current_sidecar = _capture_sidecar_input(inspection.source_file)
+        if current_sidecar != expected_sidecar:
+            reason = "Technique sidecar changed during preprocessing"
+            _mark_discarded(record, reason)
+            LOGGER.warning("Discarded %s: %s", source_label, reason)
+            continue
+        _populate_sidecar_record(record, sidecar)
 
         instrument = midi.instruments[inspection.selected_track]
         initial_silence = (
@@ -342,9 +516,19 @@ def _process_sources(
         )
         try:
             normalized = normalize_instrument(
-                instrument, inspection.tempo_bpm, config.preprocessing
+                instrument,
+                inspection.tempo_bpm,
+                config.preprocessing,
+                resolution=midi.resolution,
+                source_pitch_bend_range_semitones=(
+                    inspection.tracks[inspection.selected_track]
+                    .source_pitch_bend_range_semitones
+                ),
+                canonical_pitch_bend_range_semitones=(
+                    config.validation.canonical_pitch_bend_range_semitones
+                ),
             )
-        except QuantizationCollisionError as exc:
+        except (QuantizationCollisionError, PitchBendNormalizationError) as exc:
             reason = str(exc)
             _mark_discarded(record, reason)
             LOGGER.warning("Discarded %s: %s", source_label, reason)
@@ -355,6 +539,9 @@ def _process_sources(
             config.preprocessing,
             resolution=midi.resolution,
             source_duration_seconds=normalized_source_duration,
+            canonical_pitch_bend_range_semitones=(
+                config.validation.canonical_pitch_bend_range_semitones
+            ),
         )
         record["num_base_fragments"] = len(phrases)
         if not phrases:
@@ -368,61 +555,110 @@ def _process_sources(
         source_stem = _safe_source_stem(source_label)
         offsets = augmentation_offsets(config.augmentation, split)
         write_failures: list[dict[str, Any]] = []
-        for phrase in phrases:
-            for semitones in offsets:
-                transposed = transpose_midi(
-                    phrase.midi,
-                    semitones=semitones,
-                    pitch_min=config.validation.pitch_min,
-                    pitch_max=config.validation.pitch_max,
-                )
-                if transposed is None:
-                    LOGGER.debug(
-                        "Skipped out-of-range transposition %+d for %s phrase %d",
-                        semitones,
-                        source_label,
-                        phrase.phrase_index,
+        variants: list[tuple[Any, int, Any, tuple[Any, ...]]] = []
+        try:
+            for phrase in phrases:
+                for semitones in offsets:
+                    techniques = project_phrase_techniques(
+                        source_midi=midi,
+                        instrument_index=inspection.selected_track,
+                        sidecar=sidecar,
+                        normalized_instrument=normalized,
+                        phrase=phrase,
+                        tempo_bpm=inspection.tempo_bpm,
+                        processing=config.preprocessing,
+                        semitones=semitones,
+                        pitch_min=config.validation.pitch_min,
+                        pitch_max=config.validation.pitch_max,
                     )
-                    continue
-                filename = (
-                    f"{source_stem}_phrase-{phrase.phrase_index:04d}_"
-                    f"{_transpose_tag(semitones)}.mid"
-                )
-                staged_output_path = staging_dir / split / filename
-                final_output_path = final_run_dir / split / filename
-                try:
-                    write_midi(transposed, staged_output_path)
-                except MidiWriteError as exc:
-                    write_failures.append(
-                        {
-                            "phrase_index": phrase.phrase_index,
-                            "transpose_semitones": semitones,
-                            "reason": exc.manifest_reason,
-                        }
+                    if techniques is None:
+                        LOGGER.debug(
+                            "Skipped out-of-range slide target at %+d for %s "
+                            "phrase %d",
+                            semitones,
+                            source_label,
+                            phrase.phrase_index,
+                        )
+                        continue
+                    transposed = transpose_midi(
+                        phrase.midi,
+                        semitones=semitones,
+                        pitch_min=config.validation.pitch_min,
+                        pitch_max=config.validation.pitch_max,
                     )
-                    LOGGER.error("%s", exc)
-                    continue
-                output_label = relative_label(
-                    final_output_path, config.project_root
-                )
-                num_notes = len(transposed.instruments[0].notes)
-                fragment_records.append(
+                    if transposed is None:
+                        LOGGER.debug(
+                            "Skipped out-of-range transposition %+d for %s phrase %d",
+                            semitones,
+                            source_label,
+                            phrase.phrase_index,
+                        )
+                        continue
+                    variants.append((phrase, semitones, transposed, techniques))
+        except TechniqueProjectionError as exc:
+            reason = f"Could not project guitar techniques: {exc}"
+            _mark_discarded(record, reason)
+            LOGGER.warning("Discarded %s: %s", source_label, reason)
+            continue
+        for phrase, semitones, transposed, techniques in variants:
+            filename = (
+                f"{source_stem}_phrase-{phrase.phrase_index:04d}_"
+                f"{_transpose_tag(semitones)}.mid"
+            )
+            staged_output_path = staging_dir / split / filename
+            final_output_path = final_run_dir / split / filename
+            try:
+                write_midi(transposed, staged_output_path)
+            except MidiWriteError as exc:
+                write_failures.append(
                     {
-                        "source_file": source_label,
-                        "split": split,
-                        "track_number": inspection.selected_track,
-                        "instrument_index": inspection.selected_track,
                         "phrase_index": phrase.phrase_index,
                         "transpose_semitones": semitones,
-                        "output_file": output_label,
-                        "num_notes": num_notes,
-                        "nominal_duration_seconds": phrase.nominal_duration_seconds,
-                        "actual_note_duration_seconds": float(
-                            transposed.get_end_time()
-                        ),
+                        "reason": exc.manifest_reason,
                     }
                 )
-                record["num_fragments_generated"] += 1
+                LOGGER.error("%s", exc)
+                continue
+            output_label = relative_label(final_output_path, config.project_root)
+            num_notes = len(transposed.instruments[0].notes)
+            output_fingerprint = _fingerprint_file(staged_output_path)
+            output_instrument = transposed.instruments[0]
+            expressive_bends = sum(
+                bend.pitch != 0 for bend in output_instrument.pitch_bends
+            )
+            actual_note_duration = max(note.end for note in output_instrument.notes)
+            fragment_records.append(
+                {
+                    "source_file": source_label,
+                    "split": split,
+                    "track_number": inspection.selected_track,
+                    "instrument_index": inspection.selected_track,
+                    "phrase_index": phrase.phrase_index,
+                    "transpose_semitones": semitones,
+                    "output_file": output_label,
+                    "num_notes": num_notes,
+                    "num_pitch_bend_events": len(output_instrument.pitch_bends),
+                    "num_expressive_pitch_bend_events": expressive_bends,
+                    "pitch_bend_range_semitones": (
+                        config.validation.canonical_pitch_bend_range_semitones
+                        if expressive_bends
+                        else None
+                    ),
+                    "synthetic_initial_pitch_bend": (
+                        phrase.synthetic_initial_pitch_bend
+                    ),
+                    "synthetic_final_pitch_bend_reset": (
+                        phrase.synthetic_final_pitch_bend_reset
+                    ),
+                    "technique_coverage": record["technique_coverage"],
+                    "techniques": [technique.as_dict() for technique in techniques],
+                    "output_sha256": output_fingerprint.sha256,
+                    "output_size_bytes": output_fingerprint.size_bytes,
+                    "nominal_duration_seconds": phrase.nominal_duration_seconds,
+                    "actual_note_duration_seconds": float(actual_note_duration),
+                }
+            )
+            record["num_fragments_generated"] += 1
         if write_failures:
             record["write_errors"] = write_failures
         if record["num_fragments_generated"] == 0:
@@ -441,7 +677,9 @@ def run_preprocessing(config: PreprocessConfig) -> PreprocessReport:
     """Run validation, source-level splitting, phrase creation, and augmentation."""
 
     files = discover_midi_files(config.paths.input_dir)
+    _validate_no_orphan_sidecars(config.paths.input_dir, files)
     fingerprints = {path: _try_fingerprint(path) for path in files}
+    sidecar_inputs = {path: _capture_sidecar_input(path) for path in files}
     inspections = [
         inspect_midi(path, config.validation, config.track_selection)
         for path in files
@@ -449,12 +687,16 @@ def run_preprocessing(config: PreprocessConfig) -> PreprocessReport:
     fingerprints_after_inspection = {
         path: _try_fingerprint(path) for path in files
     }
+    sidecars_after_inspection = {
+        path: _capture_sidecar_input(path) for path in files
+    }
     changed_sources = {
         path
         for path in files
         if fingerprints[path] is None
         or fingerprints_after_inspection[path] is None
         or fingerprints[path] != fingerprints_after_inspection[path]
+        or sidecar_inputs[path] != sidecars_after_inspection[path]
     }
     labels = {
         inspection.source_file: _source_label(inspection.source_file, config)
@@ -488,7 +730,11 @@ def run_preprocessing(config: PreprocessConfig) -> PreprocessReport:
     configuration_sha256 = _canonical_hash(configuration)
     tool_versions = _tool_versions()
     run_id = _make_run_id(
-        configuration_sha256, labels, fingerprints, tool_versions
+        configuration_sha256,
+        labels,
+        fingerprints,
+        sidecar_inputs,
+        tool_versions,
     )
     final_run_dir = config.paths.processed_dir / "runs" / run_id
     staging_dir = _create_staging_directory(config.paths.processed_dir)
@@ -500,12 +746,18 @@ def run_preprocessing(config: PreprocessConfig) -> PreprocessReport:
             labels,
             assignments,
             fingerprints,
+            sidecar_inputs,
             content_group_sizes,
             changed_sources,
             staging_dir,
             final_run_dir,
         )
         compatible_count = sum(record["compatible"] for record in source_records)
+        current_files = discover_midi_files(config.paths.input_dir)
+        if current_files != files:
+            raise RuntimeError("Raw MIDI inventory changed before publication.")
+        _validate_no_orphan_sidecars(config.paths.input_dir, current_files)
+        _verify_captured_inputs(fingerprints, sidecar_inputs)
         manifest = {
             "schema_version": PIPELINE_SCHEMA_VERSION,
             "run_id": run_id,

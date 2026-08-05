@@ -8,6 +8,7 @@ dataset can be used for training.
 
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
@@ -19,10 +20,26 @@ import re
 from typing import Any
 
 
-TOKENIZATION_MANIFEST_SCHEMA_VERSION = 1
-TOKEN_SEQUENCE_SCHEMA_VERSION = 1
+TOKENIZATION_MANIFEST_SCHEMA_VERSION = 2
+TOKEN_SEQUENCE_SCHEMA_VERSION = 2
+PREPROCESSING_MANIFEST_SCHEMA_VERSION = 3
 DEFAULT_MAX_SEQUENCE_LENGTH = 384
 SPLITS = ("train", "validation", "test")
+TECHNIQUE_TYPES = (
+    "DEAD_NOTE",
+    "PALM_MUTE_ON",
+    "PALM_MUTE_OFF",
+    "SLIDE_UP",
+    "SLIDE_DOWN",
+    "VIBRATO",
+)
+TECHNIQUE_COVERAGE = ("UNLABELED", "COMPLETE")
+PITCH_BEND_SENSITIVITY_SEMITONES = 6
+
+_TECHNIQUE_ORDER = {
+    technique_type: index
+    for index, technique_type in enumerate(TECHNIQUE_TYPES)
+}
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{20}$")
@@ -47,6 +64,7 @@ class _Sequence:
     sequence_id: str
     split: str
     ids: tuple[int, ...]
+    technique_coverage: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +79,7 @@ class _Corpus:
     pad_token_id: int
     bos_token_id: int
     eos_token_id: int
+    duration_token_ids: frozenset[int]
     sequences: tuple[_Sequence, ...]
 
 
@@ -131,9 +150,17 @@ class TokenizedSequenceDataset:
         sequence = self._sequences[index]
         input_ids = sequence.ids[:-1]
         target_ids = sequence.ids[1:]
+        if sequence.technique_coverage == "COMPLETE":
+            loss_mask = (True,) * len(input_ids)
+        else:
+            loss_mask = tuple(
+                token_id not in self._corpus.duration_token_ids
+                for token_id in input_ids
+            )
         return {
             "input_ids": input_ids,
             "target_ids": target_ids,
+            "loss_mask": loss_mask,
             "length": len(input_ids),
             "sequence_id": sequence.sequence_id,
             "split": sequence.split,
@@ -214,9 +241,11 @@ def collate_token_sequences(
 ) -> dict[str, object]:
     """Dynamically pad one batch and return next-token training tensors.
 
-    Both inputs and targets use PAD in padded positions.  The trainer must pass
-    the same id as ``ignore_index`` to cross entropy.  The boolean
-    ``attention_mask`` and integer ``lengths`` identify the real positions.
+    Both inputs and targets use PAD in padded positions.  Targets also use PAD
+    at real positions explicitly excluded by each sample's ``loss_mask``.  The
+    trainer must pass the same id as ``ignore_index`` to cross entropy.  The
+    boolean ``attention_mask`` and integer ``lengths`` continue to identify all
+    real positions, independently of whether they contribute to loss.
     """
 
     pad_id = _require_nonnegative_int(pad_token_id, "pad_token_id")
@@ -225,12 +254,21 @@ def collate_token_sequences(
     if not samples:
         raise DatasetContractError("Cannot collate an empty batch.")
 
-    normalized: list[tuple[tuple[int, ...], tuple[int, ...], int, str, str]] = []
+    normalized: list[
+        tuple[tuple[int, ...], tuple[int, ...], tuple[bool, ...], int, str, str]
+    ] = []
     for index, sample in enumerate(samples):
         name = f"samples[{index}]"
         if not isinstance(sample, Mapping):
             raise DatasetContractError(f"{name} must be a mapping.")
-        required = {"input_ids", "target_ids", "length", "sequence_id", "split"}
+        required = {
+            "input_ids",
+            "target_ids",
+            "loss_mask",
+            "length",
+            "sequence_id",
+            "split",
+        }
         missing = sorted(required - set(sample))
         if missing:
             raise DatasetContractError(
@@ -238,18 +276,25 @@ def collate_token_sequences(
             )
         input_ids = _normalize_ids(sample["input_ids"], f"{name}.input_ids")
         target_ids = _normalize_ids(sample["target_ids"], f"{name}.target_ids")
+        loss_mask = _normalize_loss_mask(sample["loss_mask"], f"{name}.loss_mask")
         length = _require_positive_int(sample["length"], f"{name}.length")
         sequence_id = _require_string(sample["sequence_id"], f"{name}.sequence_id")
         split = _require_split(sample["split"], f"{name}.split")
-        if len(input_ids) != len(target_ids) or len(input_ids) != length:
+        if (
+            len(input_ids) != len(target_ids)
+            or len(input_ids) != len(loss_mask)
+            or len(input_ids) != length
+        ):
             raise DatasetContractError(
-                f"{name} input, target, and declared lengths must match."
+                f"{name} input, target, loss-mask, and declared lengths must match."
             )
         if pad_id in input_ids or pad_id in target_ids:
             raise DatasetContractError(
                 f"{name} contains PAD before batch collation."
             )
-        normalized.append((input_ids, target_ids, length, sequence_id, split))
+        normalized.append(
+            (input_ids, target_ids, loss_mask, length, sequence_id, split)
+        )
 
     try:
         import torch
@@ -260,23 +305,29 @@ def collate_token_sequences(
         ) from exc
 
     batch_size = len(normalized)
-    width = max(item[2] for item in normalized)
+    width = max(item[3] for item in normalized)
     inputs = torch.full((batch_size, width), pad_id, dtype=torch.long)
     targets = torch.full((batch_size, width), pad_id, dtype=torch.long)
-    lengths = torch.tensor([item[2] for item in normalized], dtype=torch.long)
-    for row, (input_ids, target_ids, length, _, _) in enumerate(normalized):
+    loss_mask = torch.zeros((batch_size, width), dtype=torch.bool)
+    lengths = torch.tensor([item[3] for item in normalized], dtype=torch.long)
+    for row, (input_ids, target_ids, sample_loss_mask, length, _, _) in enumerate(
+        normalized
+    ):
         inputs[row, :length] = torch.tensor(input_ids, dtype=torch.long)
         targets[row, :length] = torch.tensor(target_ids, dtype=torch.long)
+        loss_mask[row, :length] = torch.tensor(sample_loss_mask, dtype=torch.bool)
+        targets[row, :length].masked_fill_(~loss_mask[row, :length], pad_id)
     attention_mask = (
         torch.arange(width, dtype=torch.long).unsqueeze(0) < lengths.unsqueeze(1)
     )
     return {
         "input_ids": inputs,
         "target_ids": targets,
+        "loss_mask": loss_mask,
         "lengths": lengths,
         "attention_mask": attention_mask,
-        "sequence_ids": [item[3] for item in normalized],
-        "splits": [item[4] for item in normalized],
+        "sequence_ids": [item[4] for item in normalized],
+        "splits": [item[5] for item in normalized],
     }
 
 
@@ -308,9 +359,13 @@ def _load_corpus(
         "sequences",
     }
     _require_exact_keys(payload, required_root, "Stage 2 manifest")
-    if _require_int(payload["schema_version"], "schema_version") != 1:
+    if (
+        _require_int(payload["schema_version"], "schema_version")
+        != TOKENIZATION_MANIFEST_SCHEMA_VERSION
+    ):
         raise DatasetContractError(
-            "Stage 3 requires a Stage 2 manifest with schema_version 1."
+            "Stage 3 requires a Stage 2 manifest with schema_version "
+            f"{TOKENIZATION_MANIFEST_SCHEMA_VERSION}."
         )
     run_id = _require_string(payload["tokenization_run_id"], "tokenization_run_id")
     if not _RUN_ID_PATTERN.fullmatch(run_id):
@@ -376,6 +431,7 @@ def _load_corpus(
         pad_token_id=tokenizer_info["pad"],
         bos_token_id=tokenizer_info["bos"],
         eos_token_id=tokenizer_info["eos"],
+        duration_token_ids=tokenizer_info["duration_token_ids"],
         sequences=sequences,
     )
 
@@ -393,8 +449,16 @@ def _validate_preprocessing(value: object, root: Path) -> Mapping[str, Any]:
     _declared_relative_path(preprocessing["manifest_path"], "preprocessing.manifest_path")
     _resolve_declared_path(preprocessing["manifest_path"], root, "preprocessing.manifest_path")
     _require_sha256(preprocessing["manifest_sha256"], "preprocessing.manifest_sha256")
-    if _require_int(preprocessing["schema_version"], "preprocessing.schema_version") != 2:
-        raise DatasetContractError("preprocessing.schema_version must be 2.")
+    if (
+        _require_int(
+            preprocessing["schema_version"], "preprocessing.schema_version"
+        )
+        != PREPROCESSING_MANIFEST_SCHEMA_VERSION
+    ):
+        raise DatasetContractError(
+            "preprocessing.schema_version must be "
+            f"{PREPROCESSING_MANIFEST_SCHEMA_VERSION}."
+        )
     preprocessing_run_id = _require_string(preprocessing["run_id"], "preprocessing.run_id")
     if not _RUN_ID_PATTERN.fullmatch(preprocessing_run_id):
         raise DatasetContractError(
@@ -438,10 +502,14 @@ def _validate_tokenizer(
         "vocabulary_sha256",
         "vocabulary_size",
         "special_token_ids",
+        "technique_token_ids",
+        "pitch_bend_sensitivity_semitones",
     }
     _require_exact_keys(tokenizer, required, "tokenizer")
-    if tokenizer["type"] != "REMI":
-        raise DatasetContractError("Stage 3 requires tokenizer.type 'REMI'.")
+    if tokenizer["type"] != "GuitarREMI":
+        raise DatasetContractError(
+            "Stage 3 requires tokenizer.type 'GuitarREMI'."
+        )
     tokenizer_path = _resolve_declared_path(tokenizer["path"], root, "tokenizer.path")
     if tokenizer_path != run_dir / "tokenizer.json":
         raise DatasetContractError("tokenizer.path must be <tokenized_run_dir>/tokenizer.json.")
@@ -463,6 +531,22 @@ def _validate_tokenizer(
     eos = _require_nonnegative_int(special["eos"], "tokenizer.special_token_ids.eos")
     if len({pad, bos, eos}) != 3:
         raise DatasetContractError("PAD, BOS, and EOS token IDs must be distinct.")
+    technique_token_ids = _normalize_technique_token_ids(
+        tokenizer["technique_token_ids"], "tokenizer.technique_token_ids"
+    )
+    if set(technique_token_ids.values()).intersection({pad, bos, eos}):
+        raise DatasetContractError(
+            "Technique token IDs must be distinct from PAD, BOS, and EOS."
+        )
+    pitch_bend_sensitivity = _require_positive_int(
+        tokenizer["pitch_bend_sensitivity_semitones"],
+        "tokenizer.pitch_bend_sensitivity_semitones",
+    )
+    if pitch_bend_sensitivity != PITCH_BEND_SENSITIVITY_SEMITONES:
+        raise DatasetContractError(
+            "tokenizer.pitch_bend_sensitivity_semitones must be "
+            f"{PITCH_BEND_SENSITIVITY_SEMITONES}."
+        )
 
     tokenizer_file = _read_json_file(tokenizer_path, "tokenizer")
     if verify_hashes and (
@@ -471,10 +555,19 @@ def _validate_tokenizer(
     ):
         raise DatasetContractError("Tokenizer hash or size does not match the manifest.")
     embedded = tokenizer_file.json
-    if embedded.get("tokenization") != "REMI":
-        raise DatasetContractError("tokenizer.json does not describe a REMI tokenizer.")
-    if embedded.get("stage") != 2 or embedded.get("tokenization_schema_version") != 1:
-        raise DatasetContractError("tokenizer.json is not a Stage 2 schema 1 artifact.")
+    if embedded.get("tokenization") != "GuitarREMI":
+        raise DatasetContractError(
+            "tokenizer.json does not describe a GuitarREMI tokenizer."
+        )
+    if (
+        embedded.get("stage") != 2
+        or embedded.get("tokenization_schema_version")
+        != TOKENIZATION_MANIFEST_SCHEMA_VERSION
+    ):
+        raise DatasetContractError(
+            "tokenizer.json is not a Stage 2 schema "
+            f"{TOKENIZATION_MANIFEST_SCHEMA_VERSION} artifact."
+        )
     if embedded.get("tokenization_run_id") != run_id:
         raise DatasetContractError("tokenizer.json run ID does not match the manifest.")
     if embedded.get("configuration_sha256") != configuration_sha256:
@@ -483,10 +576,15 @@ def _validate_tokenizer(
         )
 
     try:
-        from .tokenizer import get_special_token_ids, load_tokenizer
+        from .tokenizer import (
+            get_special_token_ids,
+            get_technique_token_ids,
+            load_tokenizer,
+        )
 
         restored = load_tokenizer(tokenizer_path)
         actual_special = get_special_token_ids(restored)
+        actual_technique_ids = get_technique_token_ids(restored)
         actual_vocabulary = restored.vocab
     except Exception as exc:
         raise DatasetContractError(f"Could not validate tokenizer.json: {exc}") from exc
@@ -498,6 +596,17 @@ def _validate_tokenizer(
         raise DatasetContractError("Tokenizer vocabulary hash does not match the manifest.")
     if (actual_special.pad, actual_special.bos, actual_special.eos) != (pad, bos, eos):
         raise DatasetContractError("Tokenizer special-token IDs do not match the manifest.")
+    if actual_technique_ids != technique_token_ids:
+        raise DatasetContractError(
+            "Tokenizer technique-token IDs do not match the manifest."
+        )
+    actual_pitch_bend_sensitivity = getattr(
+        restored, "pitch_bend_sensitivity_semitones", None
+    )
+    if actual_pitch_bend_sensitivity != pitch_bend_sensitivity:
+        raise DatasetContractError(
+            "Tokenizer pitch-bend sensitivity does not match the manifest."
+        )
     try:
         tokenizer_unchanged = tokenizer_path.read_bytes() == tokenizer_file.raw
     except OSError as exc:
@@ -506,9 +615,39 @@ def _validate_tokenizer(
         ) from exc
     if not tokenizer_unchanged:
         raise DatasetContractError("Tokenizer changed while it was being validated.")
-    vocabulary_ids = frozenset(int(token_id) for token_id in actual_vocabulary.values())
+    vocabulary_by_id: dict[int, str] = {}
+    for token, token_id in actual_vocabulary.items():
+        if not isinstance(token, str) or not token:
+            raise DatasetContractError(
+                "Tokenizer vocabulary keys must be non-empty strings."
+            )
+        normalized_id = _require_nonnegative_int(
+            token_id, f"tokenizer vocabulary token {token!r}"
+        )
+        if normalized_id in vocabulary_by_id:
+            raise DatasetContractError("Tokenizer vocabulary IDs must be unique.")
+        vocabulary_by_id[normalized_id] = token
+    vocabulary_ids = frozenset(vocabulary_by_id)
     if len(vocabulary_ids) != vocabulary_size:
         raise DatasetContractError("Tokenizer vocabulary IDs must be unique.")
+    pitch_bend_ids = frozenset(
+        token_id
+        for token_id, token in vocabulary_by_id.items()
+        if token.startswith("PitchBend_")
+    )
+    if not pitch_bend_ids:
+        raise DatasetContractError(
+            "GuitarREMI vocabulary must contain PitchBend tokens."
+        )
+    duration_token_ids = frozenset(
+        token_id
+        for token_id, token in vocabulary_by_id.items()
+        if token.startswith("Duration_")
+    )
+    if not duration_token_ids:
+        raise DatasetContractError(
+            "GuitarREMI vocabulary must contain Duration tokens."
+        )
 
     return {
         "path": tokenizer_path,
@@ -518,7 +657,119 @@ def _validate_tokenizer(
         "pad": pad,
         "bos": bos,
         "eos": eos,
+        "technique_token_ids": technique_token_ids,
+        "pitch_bend_ids": pitch_bend_ids,
+        "duration_token_ids": duration_token_ids,
     }
+
+
+def _normalize_technique_token_ids(value: object, name: str) -> dict[str, int]:
+    mapping = _require_mapping(value, name)
+    _require_exact_keys(mapping, set(TECHNIQUE_TYPES), name)
+    normalized = {
+        technique_type: _require_nonnegative_int(
+            mapping[technique_type], f"{name}.{technique_type}"
+        )
+        for technique_type in TECHNIQUE_TYPES
+    }
+    if len(set(normalized.values())) != len(TECHNIQUE_TYPES):
+        raise DatasetContractError(f"{name} IDs must be distinct.")
+    return normalized
+
+
+def _require_technique_coverage(value: object, name: str) -> str:
+    coverage = _require_string(value, name)
+    if coverage not in TECHNIQUE_COVERAGE:
+        raise DatasetContractError(
+            f"{name} must be one of {', '.join(TECHNIQUE_COVERAGE)}."
+        )
+    return coverage
+
+
+def _normalize_techniques(
+    value: object,
+    name: str,
+    *,
+    num_notes: int,
+    coverage: str,
+) -> tuple[tuple[str, int], ...]:
+    if not isinstance(value, list):
+        raise DatasetContractError(f"{name} must be a JSON array.")
+    normalized: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for index, raw_annotation in enumerate(value):
+        annotation_name = f"{name}[{index}]"
+        annotation = _require_mapping(raw_annotation, annotation_name)
+        _require_exact_keys(annotation, {"type", "note_index"}, annotation_name)
+        technique_type = _require_string(
+            annotation["type"], f"{annotation_name}.type"
+        )
+        if technique_type not in _TECHNIQUE_ORDER:
+            raise DatasetContractError(
+                f"{annotation_name}.type must be one of "
+                f"{', '.join(TECHNIQUE_TYPES)}."
+            )
+        note_index = _require_nonnegative_int(
+            annotation["note_index"], f"{annotation_name}.note_index"
+        )
+        if note_index >= num_notes:
+            raise DatasetContractError(
+                f"{annotation_name}.note_index {note_index} is outside the "
+                f"{num_notes}-note sequence."
+            )
+        identity = (technique_type, note_index)
+        if identity in seen:
+            raise DatasetContractError(
+                f"{name} contains duplicate technique {technique_type} "
+                f"for note {note_index}."
+            )
+        seen.add(identity)
+        normalized.append(identity)
+
+    canonical = sorted(
+        normalized,
+        key=lambda item: (item[1], _TECHNIQUE_ORDER[item[0]]),
+    )
+    if normalized != canonical:
+        raise DatasetContractError(
+            f"{name} must be in canonical note/type order."
+        )
+    if coverage == "UNLABELED" and normalized:
+        raise DatasetContractError(
+            f"{name} must be empty when technique_coverage is UNLABELED."
+        )
+
+    by_note: dict[int, set[str]] = defaultdict(set)
+    for technique_type, note_index in normalized:
+        by_note[note_index].add(technique_type)
+    for note_index, types in by_note.items():
+        if {"SLIDE_UP", "SLIDE_DOWN"}.issubset(types):
+            raise DatasetContractError(
+                f"{name} note {note_index} cannot use SLIDE_UP and "
+                "SLIDE_DOWN together."
+            )
+        if {"PALM_MUTE_ON", "PALM_MUTE_OFF"}.issubset(types):
+            raise DatasetContractError(
+                f"{name} note {note_index} cannot switch palm mute on and "
+                "off together."
+            )
+
+    palm_muted = False
+    for technique_type, note_index in normalized:
+        if technique_type == "PALM_MUTE_ON":
+            if palm_muted:
+                raise DatasetContractError(
+                    f"{name} has redundant PALM_MUTE_ON at note {note_index}."
+                )
+            palm_muted = True
+        elif technique_type == "PALM_MUTE_OFF":
+            if not palm_muted:
+                raise DatasetContractError(
+                    f"{name} has PALM_MUTE_OFF without an active mute at "
+                    f"note {note_index}."
+                )
+            palm_muted = False
+    return tuple(normalized)
 
 
 def _validate_sequences(
@@ -538,6 +789,8 @@ def _validate_sequences(
         "nominal_duration_seconds",
         "num_musical_tokens",
         "num_notes",
+        "num_pitch_bend_tokens",
+        "num_technique_tokens",
         "num_tokens",
         "phrase_index",
         "processed_midi",
@@ -553,6 +806,8 @@ def _validate_sequences(
         "source_sha256",
         "split",
         "token_error_ratio",
+        "technique_coverage",
+        "techniques",
         "track_number",
         "transpose_semitones",
     }
@@ -640,7 +895,14 @@ def _validate_sequences(
         sequence_payload = sequence_file.json
         _require_exact_keys(
             sequence_payload,
-            {"schema_version", "sequence_id", "ids", "programs"},
+            {
+                "schema_version",
+                "sequence_id",
+                "ids",
+                "programs",
+                "technique_coverage",
+                "techniques",
+            },
             f"sequence '{sequence_id}'",
         )
         if _require_int(
@@ -648,7 +910,8 @@ def _validate_sequences(
             f"sequence '{sequence_id}'.schema_version",
         ) != TOKEN_SEQUENCE_SCHEMA_VERSION:
             raise DatasetContractError(
-                f"Sequence '{sequence_id}' must use schema_version 1."
+                f"Sequence '{sequence_id}' must use schema_version "
+                f"{TOKEN_SEQUENCE_SCHEMA_VERSION}."
             )
         if sequence_payload["sequence_id"] != sequence_id:
             raise DatasetContractError(
@@ -661,6 +924,37 @@ def _validate_sequences(
         if payload_programs != programs:
             raise DatasetContractError(
                 f"Sequence '{sequence_id}' program metadata does not match its record."
+            )
+        num_notes = _require_positive_int(
+            record["num_notes"], f"{name}.num_notes"
+        )
+        record_coverage = _require_technique_coverage(
+            record["technique_coverage"], f"{name}.technique_coverage"
+        )
+        payload_coverage = _require_technique_coverage(
+            sequence_payload["technique_coverage"],
+            f"sequence '{sequence_id}'.technique_coverage",
+        )
+        if payload_coverage != record_coverage:
+            raise DatasetContractError(
+                f"Sequence '{sequence_id}' technique coverage does not match "
+                "its record."
+            )
+        record_techniques = _normalize_techniques(
+            record["techniques"],
+            f"{name}.techniques",
+            num_notes=num_notes,
+            coverage=record_coverage,
+        )
+        payload_techniques = _normalize_techniques(
+            sequence_payload["techniques"],
+            f"sequence '{sequence_id}'.techniques",
+            num_notes=num_notes,
+            coverage=payload_coverage,
+        )
+        if payload_techniques != record_techniques:
+            raise DatasetContractError(
+                f"Sequence '{sequence_id}' techniques do not match its record."
             )
         ids = _normalize_ids(sequence_payload["ids"], f"sequence '{sequence_id}'.ids")
         if len(ids) < 3:
@@ -689,6 +983,44 @@ def _validate_sequences(
                 + ", ".join(str(token_id) for token_id in unknown)
                 + "."
             )
+        technique_token_ids = tokenizer_info["technique_token_ids"]
+        technique_id_values = frozenset(technique_token_ids.values())
+        actual_technique_ids = Counter(
+            token_id
+            for token_id in ids
+            if token_id in technique_id_values
+        )
+        expected_technique_ids = Counter(
+            technique_token_ids[technique_type]
+            for technique_type, _ in record_techniques
+        )
+        if actual_technique_ids != expected_technique_ids:
+            raise DatasetContractError(
+                f"Sequence '{sequence_id}' technique token IDs do not match "
+                "its canonical annotations."
+            )
+        num_technique_tokens = _require_nonnegative_int(
+            record["num_technique_tokens"], f"{name}.num_technique_tokens"
+        )
+        if (
+            num_technique_tokens != len(record_techniques)
+            or num_technique_tokens != sum(actual_technique_ids.values())
+        ):
+            raise DatasetContractError(
+                f"{name}.num_technique_tokens does not match sequence "
+                f"'{sequence_id}'."
+            )
+        actual_pitch_bend_tokens = sum(
+            token_id in tokenizer_info["pitch_bend_ids"] for token_id in ids
+        )
+        num_pitch_bend_tokens = _require_nonnegative_int(
+            record["num_pitch_bend_tokens"], f"{name}.num_pitch_bend_tokens"
+        )
+        if num_pitch_bend_tokens != actual_pitch_bend_tokens:
+            raise DatasetContractError(
+                f"{name}.num_pitch_bend_tokens does not match PitchBend IDs "
+                f"in sequence '{sequence_id}'."
+            )
 
         num_tokens = _require_positive_int(record["num_tokens"], f"{name}.num_tokens")
         num_musical = _require_positive_int(
@@ -698,7 +1030,6 @@ def _validate_sequences(
             raise DatasetContractError(
                 f"{name} token counts do not match sequence '{sequence_id}'."
             )
-        _require_positive_int(record["num_notes"], f"{name}.num_notes")
         _require_nonnegative_int(record["track_number"], f"{name}.track_number")
         _require_nonnegative_int(record["instrument_index"], f"{name}.instrument_index")
         if record["track_number"] != record["instrument_index"]:
@@ -718,7 +1049,14 @@ def _validate_sequences(
         ) != 0.0:
             raise DatasetContractError(f"{name}.token_error_ratio must be zero.")
 
-        sequences.append(_Sequence(sequence_id=sequence_id, split=split, ids=ids))
+        sequences.append(
+            _Sequence(
+                sequence_id=sequence_id,
+                split=split,
+                ids=ids,
+                technique_coverage=record_coverage,
+            )
+        )
         records.append(record)
 
     order = [(SPLITS.index(sequence.split), str(record["sequence_file"])) for sequence, record in zip(sequences, records, strict=True)]
@@ -733,7 +1071,15 @@ def _validate_summary(value: object, records: Sequence[Mapping[str, Any]]) -> No
     summary = _require_mapping(value, "summary")
     _require_exact_keys(
         summary,
-        {"sequences", "total_tokens", "total_musical_tokens", "length", "by_split"},
+        {
+            "sequences",
+            "total_tokens",
+            "total_musical_tokens",
+            "length",
+            "by_split",
+            "techniques",
+            "pitch_bends",
+        },
         "summary",
     )
 
@@ -778,6 +1124,98 @@ def _validate_summary(value: object, records: Sequence[Mapping[str, Any]]) -> No
                 raise DatasetContractError(
                     f"summary.by_split.{split}.{field} does not match sequences."
                 )
+
+    techniques = _require_mapping(summary["techniques"], "summary.techniques")
+    _require_exact_keys(
+        techniques,
+        {"total_tokens", "by_type", "coverage"},
+        "summary.techniques",
+    )
+    expected_total_techniques = sum(
+        int(record["num_technique_tokens"]) for record in records
+    )
+    actual_total_techniques = _require_nonnegative_int(
+        techniques["total_tokens"], "summary.techniques.total_tokens"
+    )
+    if actual_total_techniques != expected_total_techniques:
+        raise DatasetContractError(
+            "summary.techniques.total_tokens does not match sequences."
+        )
+    by_type = _require_mapping(
+        techniques["by_type"], "summary.techniques.by_type"
+    )
+    _require_exact_keys(
+        by_type, set(TECHNIQUE_TYPES), "summary.techniques.by_type"
+    )
+    expected_by_type = Counter(
+        annotation["type"]
+        for record in records
+        for annotation in record["techniques"]
+    )
+    for technique_type in TECHNIQUE_TYPES:
+        actual_count = _require_nonnegative_int(
+            by_type[technique_type],
+            f"summary.techniques.by_type.{technique_type}",
+        )
+        if actual_count != expected_by_type[technique_type]:
+            raise DatasetContractError(
+                f"summary.techniques.by_type.{technique_type} does not "
+                "match sequences."
+            )
+    coverage = _require_mapping(
+        techniques["coverage"], "summary.techniques.coverage"
+    )
+    _require_exact_keys(
+        coverage,
+        {"complete_sequences", "unlabeled_sequences"},
+        "summary.techniques.coverage",
+    )
+    expected_complete = sum(
+        record["technique_coverage"] == "COMPLETE" for record in records
+    )
+    expected_unlabeled = len(records) - expected_complete
+    actual_complete = _require_nonnegative_int(
+        coverage["complete_sequences"],
+        "summary.techniques.coverage.complete_sequences",
+    )
+    actual_unlabeled = _require_nonnegative_int(
+        coverage["unlabeled_sequences"],
+        "summary.techniques.coverage.unlabeled_sequences",
+    )
+    if (actual_complete, actual_unlabeled) != (
+        expected_complete,
+        expected_unlabeled,
+    ):
+        raise DatasetContractError(
+            "summary.techniques.coverage does not match sequences."
+        )
+
+    pitch_bends = _require_mapping(summary["pitch_bends"], "summary.pitch_bends")
+    _require_exact_keys(
+        pitch_bends,
+        {"total_tokens", "sequences_with_pitch_bends"},
+        "summary.pitch_bends",
+    )
+    expected_pitch_bends = sum(
+        int(record["num_pitch_bend_tokens"]) for record in records
+    )
+    expected_sequences_with_bends = sum(
+        int(record["num_pitch_bend_tokens"]) > 0 for record in records
+    )
+    actual_pitch_bends = _require_nonnegative_int(
+        pitch_bends["total_tokens"], "summary.pitch_bends.total_tokens"
+    )
+    actual_sequences_with_bends = _require_nonnegative_int(
+        pitch_bends["sequences_with_pitch_bends"],
+        "summary.pitch_bends.sequences_with_pitch_bends",
+    )
+    if (actual_pitch_bends, actual_sequences_with_bends) != (
+        expected_pitch_bends,
+        expected_sequences_with_bends,
+    ):
+        raise DatasetContractError(
+            "summary.pitch_bends does not match sequences."
+        )
 
 
 def _resolve_project_root(manifest_path: Path, project_root: str | Path | None) -> Path:
@@ -943,7 +1381,21 @@ def _require_nonnegative_number(value: object, name: str) -> float:
 def _normalize_ids(value: object, name: str) -> tuple[int, ...]:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise DatasetContractError(f"{name} must be a sequence of integers.")
-    return tuple(_require_nonnegative_int(token_id, f"{name}[{index}]") for index, token_id in enumerate(value))
+    return tuple(
+        _require_nonnegative_int(token_id, f"{name}[{index}]")
+        for index, token_id in enumerate(value)
+    )
+
+
+def _normalize_loss_mask(value: object, name: str) -> tuple[bool, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise DatasetContractError(f"{name} must be a sequence of booleans.")
+    normalized: list[bool] = []
+    for index, enabled in enumerate(value):
+        if not isinstance(enabled, bool):
+            raise DatasetContractError(f"{name}[{index}] must be boolean.")
+        normalized.append(enabled)
+    return tuple(normalized)
 
 
 def _normalize_programs(value: object, name: str) -> tuple[tuple[int, bool], ...]:

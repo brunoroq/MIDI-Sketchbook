@@ -12,6 +12,9 @@ import yaml
 from midi_idea_generator.config import ConfigError
 from midi_idea_generator.tokenization_config import (
     BeatResolutionConfig,
+    GUITAR_TECHNIQUE_TOKENS,
+    PITCH_BEND_RANGE,
+    PITCH_BEND_SENSITIVITY_SEMITONES,
     load_tokenization_config,
 )
 
@@ -39,6 +42,10 @@ def _valid_payload() -> dict[str, Any]:
             "num_tempos": 32,
             "tempo_min": 40,
             "tempo_max": 250,
+            "use_pitch_bends": True,
+            "pitch_bend_range": [-8191, 8191, 65],
+            "pitch_bend_sensitivity_semitones": 6,
+            "technique_tokens": list(GUITAR_TECHNIQUE_TOKENS),
             "add_trailing_bars": True,
             "max_bar_embedding": None,
         },
@@ -97,6 +104,13 @@ def test_load_tokenization_config_resolves_paths_and_preserves_contract(
     assert config.tokenizer.special_tokens == ("PAD", "BOS", "EOS")
     assert config.tokenizer.use_velocities is False
     assert config.tokenizer.use_tempos is True
+    assert config.tokenizer.use_pitch_bends is True
+    assert config.tokenizer.pitch_bend_range == PITCH_BEND_RANGE
+    assert (
+        config.tokenizer.pitch_bend_sensitivity_semitones
+        == PITCH_BEND_SENSITIVITY_SEMITONES
+    )
+    assert config.tokenizer.technique_tokens == GUITAR_TECHNIQUE_TOKENS
     assert config.tokenizer.add_trailing_bars is True
     assert config.tokenizer.max_bar_embedding is None
 
@@ -116,6 +130,9 @@ def test_tokenizer_section_uses_documented_defaults(tmp_path: Path) -> None:
     assert config.tokenizer.encode_ids_split == "bar"
     assert config.tokenizer.tempo_min == pytest.approx(40.0)
     assert config.tokenizer.tempo_max == pytest.approx(250.0)
+    assert config.tokenizer.use_pitch_bends is True
+    assert config.tokenizer.pitch_bend_range == PITCH_BEND_RANGE
+    assert config.tokenizer.technique_tokens == GUITAR_TECHNIQUE_TOKENS
 
 
 @pytest.mark.parametrize(
@@ -155,6 +172,33 @@ def test_tokenizer_section_uses_documented_defaults(tmp_path: Path) -> None:
         ("tokenizer.num_tempos", 0, "between 1 and 512"),
         ("tokenizer.tempo_min", 250, "0 < tempo_min < tempo_max"),
         ("tokenizer.tempo_max", float("inf"), "must be finite"),
+        ("tokenizer.use_pitch_bends", False, "use_pitch_bends: true"),
+        (
+            "tokenizer.pitch_bend_range",
+            [-8192, 8191, 32],
+            "requires.*pitch_bend_range",
+        ),
+        (
+            "tokenizer.pitch_bend_range",
+            [-8191, 8191],
+            "minimum, maximum, bins",
+        ),
+        (
+            "tokenizer.pitch_bend_sensitivity_semitones",
+            2,
+            "sensitivity_semitones: 6",
+        ),
+        (
+            "tokenizer.pitch_bend_sensitivity_semitones",
+            True,
+            "must be an integer",
+        ),
+        (
+            "tokenizer.technique_tokens",
+            list(reversed(GUITAR_TECHNIQUE_TOKENS)),
+            "canonical guitar-technique tokens",
+        ),
+        ("tokenizer.technique_tokens", "Technique_VIBRATO", "must be a list"),
         ("tokenizer.add_trailing_bars", False, "add_trailing_bars: true"),
         ("tokenizer.max_bar_embedding", 0, "null or a positive integer"),
     ],
@@ -201,8 +245,8 @@ def test_load_tokenization_config_rejects_missing_and_unknown_settings(
         )
 
     unknown_tokenizer_key = _valid_payload()
-    unknown_tokenizer_key["tokenizer"]["use_pitch_bends"] = False
-    with pytest.raises(ConfigError, match="Unknown key.*use_pitch_bends"):
+    unknown_tokenizer_key["tokenizer"]["pitch_bend_curve"] = "cubic"
+    with pytest.raises(ConfigError, match="Unknown key.*pitch_bend_curve"):
         load_tokenization_config(
             _write_config(
                 project_root / "configs/unknown.yaml", unknown_tokenizer_key

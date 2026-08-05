@@ -19,15 +19,17 @@ from midi_idea_generator.dataset import (
 )
 from midi_idea_generator.tokenization_config import RemiTokenizerConfig
 from midi_idea_generator.tokenizer import (
+    TECHNIQUE_TYPES,
     build_tokenizer,
     get_special_token_ids,
+    get_technique_token_ids,
     save_tokenizer,
 )
 
 
 _TOKENIZATION_RUN_ID = "0123456789abcdefabcd"
 _PREPROCESSING_RUN_ID = "abcdef0123456789abcd"
-_CONFIGURATION = {"tokenizer": {"fixture": "stage-three-schema-one"}}
+_CONFIGURATION = {"tokenizer": {"fixture": "stage-three-schema-two"}}
 
 
 @dataclass(slots=True)
@@ -37,6 +39,10 @@ class _SyntheticCorpus:
     manifest: dict[str, Any]
     sequence_paths: dict[str, Path]
     special_ids: tuple[int, int, int]
+    technique_ids: dict[str, int]
+    pitch_bend_ids: tuple[int, ...]
+    duration_ids: tuple[int, ...]
+    ordinary_ids: tuple[int, ...]
 
     def write_manifest(self) -> None:
         _write_json(self.manifest_path, self.manifest)
@@ -81,6 +87,14 @@ def _group_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     overall = _group_summary(records)
+    technique_counts = {
+        technique_type: sum(
+            annotation["type"] == technique_type
+            for record in records
+            for annotation in record["techniques"]
+        )
+        for technique_type in TECHNIQUE_TYPES
+    }
     return {
         "sequences": overall["sequences"],
         "total_tokens": overall["total_tokens"],
@@ -95,6 +109,30 @@ def _summary(records: list[dict[str, Any]]) -> dict[str, Any]:
                 [record for record in records if record["split"] == split]
             )
             for split in ("train", "validation", "test")
+        },
+        "techniques": {
+            "total_tokens": sum(
+                record["num_technique_tokens"] for record in records
+            ),
+            "by_type": technique_counts,
+            "coverage": {
+                "complete_sequences": sum(
+                    record["technique_coverage"] == "COMPLETE"
+                    for record in records
+                ),
+                "unlabeled_sequences": sum(
+                    record["technique_coverage"] == "UNLABELED"
+                    for record in records
+                ),
+            },
+        },
+        "pitch_bends": {
+            "total_tokens": sum(
+                record["num_pitch_bend_tokens"] for record in records
+            ),
+            "sequences_with_pitch_bends": sum(
+                record["num_pitch_bend_tokens"] > 0 for record in records
+            ),
         },
     }
 
@@ -124,17 +162,38 @@ def _make_synthetic_corpus(
         tokenizer_path,
         additional_attributes={
             "stage": 2,
-            "tokenization_schema_version": 1,
+            "tokenization_schema_version": 2,
             "tokenization_run_id": _TOKENIZATION_RUN_ID,
             "configuration_sha256": configuration_sha256,
         },
     )
     tokenizer_sha256, tokenizer_size = _fingerprint(tokenizer_path)
     special = get_special_token_ids(tokenizer)
+    technique_ids = get_technique_token_ids(tokenizer)
+    pitch_bend_ids = tuple(
+        int(token_id)
+        for token, token_id in tokenizer.vocab.items()
+        if token.startswith("PitchBend_")
+    )
+    duration_ids = tuple(
+        int(token_id)
+        for token, token_id in tokenizer.vocab.items()
+        if token.startswith("Duration_")
+    )
+    ordinary_ids = tuple(
+        int(token_id)
+        for token, token_id in tokenizer.vocab.items()
+        if int(token_id) not in {special.pad, special.bos, special.eos}
+        and int(token_id) not in set(technique_ids.values())
+        and not token.startswith("PitchBend_")
+        and not token.startswith("Duration_")
+    )
     musical_ids = [
         int(token_id)
-        for token_id in tokenizer.vocab.values()
+        for token, token_id in tokenizer.vocab.items()
         if int(token_id) not in {special.pad, special.bos, special.eos}
+        and int(token_id) not in set(technique_ids.values())
+        and not token.startswith("PitchBend_")
     ]
 
     records: list[dict[str, Any]] = []
@@ -158,10 +217,12 @@ def _make_synthetic_corpus(
             _write_json(
                 sequence_path,
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "sequence_id": sequence_id,
                     "ids": ids,
                     "programs": programs,
+                    "technique_coverage": "UNLABELED",
+                    "techniques": [],
                 },
             )
             sequence_sha256, sequence_size = _fingerprint(sequence_path)
@@ -176,6 +237,8 @@ def _make_synthetic_corpus(
                 "nominal_duration_seconds": 2.0,
                 "num_musical_tokens": musical_length,
                 "num_notes": 3,
+                "num_pitch_bend_tokens": 0,
+                "num_technique_tokens": 0,
                 "num_tokens": num_tokens,
                 "phrase_index": split_index,
                 "processed_midi": processed_midi,
@@ -193,6 +256,8 @@ def _make_synthetic_corpus(
                 "source_sha256": sha256(source_file.encode("utf-8")).hexdigest(),
                 "split": split,
                 "token_error_ratio": 0.0,
+                "technique_coverage": "UNLABELED",
+                "techniques": [],
                 "track_number": 0,
                 "transpose_semitones": 0,
             }
@@ -201,13 +266,13 @@ def _make_synthetic_corpus(
             serial += 1
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "tokenization_run_id": _TOKENIZATION_RUN_ID,
         "tokenized_run_dir": run_dir.relative_to(root).as_posix(),
         "preprocessing": {
             "manifest_path": "data/splits/manifest.json",
             "manifest_sha256": "1" * 64,
-            "schema_version": 2,
+            "schema_version": 3,
             "run_id": _PREPROCESSING_RUN_ID,
             "configuration_sha256": "2" * 64,
         },
@@ -218,7 +283,7 @@ def _make_synthetic_corpus(
             "fixture": "1",
         },
         "tokenizer": {
-            "type": "REMI",
+            "type": "GuitarREMI",
             "path": tokenizer_path.relative_to(root).as_posix(),
             "sha256": tokenizer_sha256,
             "size_bytes": tokenizer_size,
@@ -229,6 +294,8 @@ def _make_synthetic_corpus(
                 "bos": special.bos,
                 "eos": special.eos,
             },
+            "technique_token_ids": technique_ids,
+            "pitch_bend_sensitivity_semitones": 6,
         },
         "summary": _summary(records),
         "sequences": records,
@@ -240,9 +307,60 @@ def _make_synthetic_corpus(
         manifest=manifest,
         sequence_paths=sequence_paths,
         special_ids=(special.pad, special.bos, special.eos),
+        technique_ids=technique_ids,
+        pitch_bend_ids=pitch_bend_ids,
+        duration_ids=duration_ids,
+        ordinary_ids=ordinary_ids,
     )
     corpus.write_manifest()
     return corpus
+
+
+def _first_sequence(
+    corpus: _SyntheticCorpus,
+) -> tuple[dict[str, Any], dict[str, Any], Path]:
+    record = corpus.manifest["sequences"][0]
+    sequence_path = corpus.root / record["sequence_file"]
+    payload = json.loads(sequence_path.read_text(encoding="utf-8"))
+    return record, payload, sequence_path
+
+
+def _publish_sequence_change(
+    corpus: _SyntheticCorpus,
+    record: dict[str, Any],
+    payload: dict[str, Any],
+    sequence_path: Path,
+) -> None:
+    _write_json(sequence_path, payload)
+    sequence_sha256, sequence_size = _fingerprint(sequence_path)
+    record["sequence_sha256"] = sequence_sha256
+    record["sequence_size_bytes"] = sequence_size
+    record["num_tokens"] = len(payload["ids"])
+    record["num_musical_tokens"] = len(payload["ids"]) - 2
+    corpus.manifest["summary"] = _summary(corpus.manifest["sequences"])
+    corpus.write_manifest()
+
+
+def _add_valid_guitar_metadata(corpus: _SyntheticCorpus) -> None:
+    record, payload, sequence_path = _first_sequence(corpus)
+    annotations = [
+        {"type": "PALM_MUTE_ON", "note_index": 0},
+        {"type": "DEAD_NOTE", "note_index": 1},
+        {"type": "PALM_MUTE_OFF", "note_index": 2},
+        {"type": "VIBRATO", "note_index": 2},
+    ]
+    record["technique_coverage"] = "COMPLETE"
+    record["techniques"] = deepcopy(annotations)
+    record["num_technique_tokens"] = len(annotations)
+    record["num_pitch_bend_tokens"] = 2
+    payload["technique_coverage"] = "COMPLETE"
+    payload["techniques"] = deepcopy(annotations)
+    payload["ids"][-1:-1] = [
+        *(corpus.technique_ids[annotation["type"]] for annotation in annotations),
+        corpus.pitch_bend_ids[0],
+        corpus.pitch_bend_ids[-1],
+    ]
+    _publish_sequence_change(corpus, record, payload, sequence_path)
 
 
 def test_dataset_uses_manifest_only_and_builds_next_token_pairs(tmp_path: Path) -> None:
@@ -268,6 +386,9 @@ def test_dataset_uses_manifest_only_and_builds_next_token_pairs(tmp_path: Path) 
     )
     assert first["input_ids"] == tuple(payload["ids"][:-1])
     assert first["target_ids"] == tuple(payload["ids"][1:])
+    assert corpus.special_ids[0] not in first["input_ids"]
+    assert corpus.special_ids[0] not in first["target_ids"]
+    assert len(first["loss_mask"]) == first["length"]
     assert first["length"] == len(payload["ids"]) - 1
     assert first["split"] == "train"
     assert first["input_ids"][0] == dataset.bos_token_id
@@ -325,14 +446,23 @@ def test_dynamic_collate_pads_inputs_targets_and_mask(tmp_path: Path) -> None:
 
     assert batch["input_ids"].shape == (2, 7)
     assert batch["target_ids"].shape == (2, 7)
+    assert batch["loss_mask"].shape == (2, 7)
     assert batch["lengths"].tolist() == [4, 7]
     assert batch["attention_mask"].dtype == torch.bool
+    assert batch["loss_mask"].dtype == torch.bool
     assert batch["attention_mask"].tolist() == [
         [True, True, True, True, False, False, False],
         [True, True, True, True, True, True, True],
     ]
     assert batch["input_ids"][0, 4:].tolist() == [dataset.pad_token_id] * 3
     assert batch["target_ids"][0, 4:].tolist() == [dataset.pad_token_id] * 3
+    assert batch["loss_mask"][0, 4:].tolist() == [False, False, False]
+    assert batch["loss_mask"][0, :4].tolist() == list(dataset[0]["loss_mask"])
+    assert batch["loss_mask"][1, :7].tolist() == list(dataset[1]["loss_mask"])
+    assert torch.all(batch["target_ids"][~batch["loss_mask"]] == dataset.pad_token_id)
+    assert int((batch["target_ids"] != dataset.pad_token_id).sum().item()) == sum(
+        sum(sample["loss_mask"]) for sample in (dataset[0], dataset[1])
+    )
     assert batch["sequence_ids"] == [
         dataset[0]["sequence_id"],
         dataset[1]["sequence_id"],
@@ -342,12 +472,64 @@ def test_dynamic_collate_pads_inputs_targets_and_mask(tmp_path: Path) -> None:
     collator = make_collate_fn(dataset.pad_token_id)
     repeated = collator([dataset[0], dataset[1]])
     assert torch.equal(repeated["input_ids"], batch["input_ids"])
+    assert torch.equal(repeated["loss_mask"], batch["loss_mask"])
+
+
+def test_unlabeled_masks_only_duration_decisions_but_complete_empty_does_not(
+    tmp_path: Path,
+) -> None:
+    torch = pytest.importorskip("torch")
+    corpus = _make_synthetic_corpus(
+        tmp_path,
+        split_lengths={"train": (5, 5)},
+    )
+    pad, bos, eos = corpus.special_ids
+    ids = [
+        bos,
+        corpus.ordinary_ids[0],
+        corpus.duration_ids[0],
+        corpus.ordinary_ids[1],
+        eos,
+    ]
+    for record in corpus.manifest["sequences"]:
+        sequence_path = corpus.root / record["sequence_file"]
+        payload = json.loads(sequence_path.read_text(encoding="utf-8"))
+        payload["ids"] = list(ids)
+        if record["sequence_id"].startswith("train-riff-01"):
+            record["technique_coverage"] = "COMPLETE"
+            payload["technique_coverage"] = "COMPLETE"
+        _publish_sequence_change(corpus, record, payload, sequence_path)
+
+    dataset = TokenizedSequenceDataset(corpus.manifest_path, "train")
+    unlabeled = dataset[0]
+    complete = dataset[1]
+
+    assert unlabeled["input_ids"] == tuple(ids[:-1])
+    assert unlabeled["target_ids"] == tuple(ids[1:])
+    assert pad not in unlabeled["target_ids"]
+    assert unlabeled["loss_mask"] == (True, True, False, True)
+    assert complete["loss_mask"] == (True, True, True, True)
+
+    batch = collate_token_sequences([unlabeled, complete], pad)
+
+    assert batch["attention_mask"].tolist() == [[True] * 4, [True] * 4]
+    assert batch["loss_mask"].tolist() == [
+        [True, True, False, True],
+        [True, True, True, True],
+    ]
+    assert batch["target_ids"][0].tolist() == [ids[1], ids[2], pad, eos]
+    assert batch["target_ids"][1].tolist() == list(ids[1:])
+    assert int((batch["target_ids"] != pad).sum().item()) == 7
+    assert torch.equal(
+        batch["target_ids"] != pad,
+        batch["loss_mask"],
+    )
 
 
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        ("schema", "schema_version 1"),
+        ("schema", "schema_version 2"),
         ("summary", "summary.sequences does not match"),
         ("sequence_traversal", "normalized relative path without traversal"),
         ("split_path", "declared split directory"),
@@ -362,7 +544,7 @@ def test_malformed_manifest_contract_is_rejected(
 ) -> None:
     corpus = _make_synthetic_corpus(tmp_path)
     if mutation == "schema":
-        corpus.manifest["schema_version"] = 2
+        corpus.manifest["schema_version"] = 1
     elif mutation == "summary":
         corpus.manifest["summary"]["sequences"] += 1
     elif mutation == "sequence_traversal":
@@ -445,6 +627,7 @@ def test_collate_rejects_pre_padded_or_inconsistent_samples() -> None:
     sample = {
         "input_ids": (1, 3),
         "target_ids": (3, 2),
+        "loss_mask": (True, True),
         "length": 2,
         "sequence_id": "valid-sequence",
         "split": "train",
@@ -460,5 +643,328 @@ def test_collate_rejects_pre_padded_or_inconsistent_samples() -> None:
             [{**sample, "length": 3}],
             pad_token_id=0,
         )
+    with pytest.raises(DatasetContractError, match="missing field.*loss_mask"):
+        collate_token_sequences(
+            [{key: value for key, value in sample.items() if key != "loss_mask"}],
+            pad_token_id=0,
+        )
+    with pytest.raises(DatasetContractError, match="must be boolean"):
+        collate_token_sequences(
+            [{**sample, "loss_mask": (True, 1)}],
+            pad_token_id=0,
+        )
+    with pytest.raises(DatasetContractError, match="lengths must match"):
+        collate_token_sequences(
+            [{**sample, "loss_mask": (True,)}],
+            pad_token_id=0,
+        )
     with pytest.raises(DatasetContractError, match="empty batch"):
         collate_token_sequences([], pad_token_id=0)
+
+
+def test_dataset_accepts_exact_guitar_technique_and_pitch_bend_contract(
+    tmp_path: Path,
+) -> None:
+    corpus = _make_synthetic_corpus(tmp_path)
+    _add_valid_guitar_metadata(corpus)
+
+    dataset = TokenizedSequenceDataset(corpus.manifest_path, "train")
+
+    assert len(dataset) == 2
+    first = corpus.manifest["sequences"][0]
+    assert first["num_technique_tokens"] == 4
+    assert first["num_pitch_bend_tokens"] == 2
+    assert corpus.manifest["summary"]["techniques"] == {
+        "total_tokens": 4,
+        "by_type": {
+            "DEAD_NOTE": 1,
+            "PALM_MUTE_ON": 1,
+            "PALM_MUTE_OFF": 1,
+            "SLIDE_UP": 0,
+            "SLIDE_DOWN": 0,
+            "VIBRATO": 1,
+        },
+        "coverage": {
+            "complete_sequences": 1,
+            "unlabeled_sequences": 3,
+        },
+    }
+    assert corpus.manifest["summary"]["pitch_bends"] == {
+        "total_tokens": 2,
+        "sequences_with_pitch_bends": 1,
+    }
+
+
+def test_complete_coverage_can_confirm_an_empty_technique_list(
+    tmp_path: Path,
+) -> None:
+    corpus = _make_synthetic_corpus(tmp_path)
+    record, payload, sequence_path = _first_sequence(corpus)
+    record["technique_coverage"] = "COMPLETE"
+    payload["technique_coverage"] = "COMPLETE"
+    _publish_sequence_change(corpus, record, payload, sequence_path)
+
+    dataset = TokenizedSequenceDataset(corpus.manifest_path, "train")
+
+    assert len(dataset) == 2
+    assert corpus.manifest["summary"]["techniques"]["coverage"] == {
+        "complete_sequences": 1,
+        "unlabeled_sequences": 3,
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("type", "tokenizer.type 'GuitarREMI'"),
+        ("missing_ids", "missing field"),
+        ("unknown_id", "unknown field"),
+        ("duplicate_ids", "IDs must be distinct"),
+        ("wrong_id", "do not match the manifest"),
+        ("sensitivity", "must be 6"),
+    ],
+)
+def test_guitar_tokenizer_manifest_contract_is_strict(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    corpus = _make_synthetic_corpus(tmp_path)
+    tokenizer = corpus.manifest["tokenizer"]
+    if mutation == "type":
+        tokenizer["type"] = "REMI"
+    elif mutation == "missing_ids":
+        tokenizer["technique_token_ids"].pop("VIBRATO")
+    elif mutation == "unknown_id":
+        tokenizer["technique_token_ids"]["UNKNOWN"] = 999
+    elif mutation == "duplicate_ids":
+        tokenizer["technique_token_ids"]["VIBRATO"] = tokenizer[
+            "technique_token_ids"
+        ]["DEAD_NOTE"]
+    elif mutation == "wrong_id":
+        tokenizer["technique_token_ids"]["VIBRATO"] = max(
+            tokenizer["technique_token_ids"].values()
+        ) + 100
+    elif mutation == "sensitivity":
+        tokenizer["pitch_bend_sensitivity_semitones"] = 5
+    else:  # pragma: no cover
+        raise AssertionError(mutation)
+    corpus.write_manifest()
+
+    with pytest.raises(DatasetContractError, match=message):
+        TokenizedSequenceDataset(corpus.manifest_path, "train")
+
+
+def test_preprocessing_and_tokenizer_artifact_schema_versions_are_exact(
+    tmp_path: Path,
+) -> None:
+    corpus = _make_synthetic_corpus(tmp_path)
+    corpus.manifest["preprocessing"]["schema_version"] = 2
+    corpus.write_manifest()
+    with pytest.raises(DatasetContractError, match="must be 3"):
+        TokenizedSequenceDataset(corpus.manifest_path, "train")
+
+    embedded_root = tmp_path / "embedded"
+    embedded_root.mkdir()
+    corpus = _make_synthetic_corpus(embedded_root)
+    tokenizer_path = corpus.root / corpus.manifest["tokenizer"]["path"]
+    tokenizer_payload = json.loads(tokenizer_path.read_text(encoding="utf-8"))
+    tokenizer_payload["tokenization_schema_version"] = 1
+    _write_json(tokenizer_path, tokenizer_payload)
+    tokenizer_sha256, tokenizer_size = _fingerprint(tokenizer_path)
+    corpus.manifest["tokenizer"]["sha256"] = tokenizer_sha256
+    corpus.manifest["tokenizer"]["size_bytes"] = tokenizer_size
+    corpus.write_manifest()
+    with pytest.raises(DatasetContractError, match="Stage 2 schema 2"):
+        TokenizedSequenceDataset(corpus.manifest_path, "train")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("coverage_value", "must be one of UNLABELED, COMPLETE"),
+        ("coverage_mismatch", "coverage does not match"),
+        ("techniques_mismatch", "techniques do not match"),
+        ("unlabeled_nonempty", "must be empty"),
+        ("noncanonical", "canonical note/type order"),
+        ("duplicate", "duplicate technique"),
+        ("out_of_range", "outside the 3-note sequence"),
+        ("boolean_index", "must be an integer"),
+        ("unknown_key", "unknown field"),
+        ("slide_conflict", "cannot use SLIDE_UP and SLIDE_DOWN"),
+        ("palm_off_without_on", "without an active mute"),
+    ],
+)
+def test_record_and_payload_technique_annotations_are_strict(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    corpus = _make_synthetic_corpus(tmp_path)
+    _add_valid_guitar_metadata(corpus)
+    record, payload, sequence_path = _first_sequence(corpus)
+    if mutation == "coverage_value":
+        record["technique_coverage"] = "PARTIAL"
+    elif mutation == "coverage_mismatch":
+        payload["technique_coverage"] = "UNLABELED"
+    elif mutation == "techniques_mismatch":
+        payload["techniques"] = payload["techniques"][:-1]
+    elif mutation == "unlabeled_nonempty":
+        record["technique_coverage"] = "UNLABELED"
+        payload["technique_coverage"] = "UNLABELED"
+    elif mutation == "noncanonical":
+        record["techniques"] = list(reversed(record["techniques"]))
+        payload["techniques"] = deepcopy(record["techniques"])
+    elif mutation == "duplicate":
+        record["techniques"].append(deepcopy(record["techniques"][0]))
+        payload["techniques"] = deepcopy(record["techniques"])
+    elif mutation == "out_of_range":
+        record["techniques"][0]["note_index"] = 3
+        payload["techniques"] = deepcopy(record["techniques"])
+    elif mutation == "boolean_index":
+        record["techniques"][0]["note_index"] = True
+        payload["techniques"] = deepcopy(record["techniques"])
+    elif mutation == "unknown_key":
+        record["techniques"][0]["extra"] = 1
+        payload["techniques"] = deepcopy(record["techniques"])
+    elif mutation == "slide_conflict":
+        annotations = [
+            {"type": "SLIDE_UP", "note_index": 0},
+            {"type": "SLIDE_DOWN", "note_index": 0},
+        ]
+        record["techniques"] = deepcopy(annotations)
+        payload["techniques"] = deepcopy(annotations)
+    elif mutation == "palm_off_without_on":
+        annotations = [{"type": "PALM_MUTE_OFF", "note_index": 0}]
+        record["techniques"] = deepcopy(annotations)
+        payload["techniques"] = deepcopy(annotations)
+    else:  # pragma: no cover
+        raise AssertionError(mutation)
+    record["num_technique_tokens"] = len(record["techniques"])
+    _publish_sequence_change(corpus, record, payload, sequence_path)
+
+    with pytest.raises(DatasetContractError, match=message):
+        TokenizedSequenceDataset(corpus.manifest_path, "train")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_token", "token IDs do not match"),
+        ("extra_token", "token IDs do not match"),
+        ("wrong_type", "token IDs do not match"),
+        ("wrong_count", "num_technique_tokens does not match"),
+    ],
+)
+def test_sequence_ids_exactly_match_declared_techniques(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    corpus = _make_synthetic_corpus(tmp_path)
+    _add_valid_guitar_metadata(corpus)
+    record, payload, sequence_path = _first_sequence(corpus)
+    if mutation == "missing_token":
+        payload["ids"].remove(corpus.technique_ids["DEAD_NOTE"])
+    elif mutation == "extra_token":
+        payload["ids"].insert(-1, corpus.technique_ids["SLIDE_UP"])
+    elif mutation == "wrong_type":
+        index = payload["ids"].index(corpus.technique_ids["DEAD_NOTE"])
+        payload["ids"][index] = corpus.technique_ids["SLIDE_UP"]
+    elif mutation == "wrong_count":
+        record["num_technique_tokens"] += 1
+    else:  # pragma: no cover
+        raise AssertionError(mutation)
+    _publish_sequence_change(corpus, record, payload, sequence_path)
+
+    with pytest.raises(DatasetContractError, match=message):
+        TokenizedSequenceDataset(corpus.manifest_path, "train")
+
+
+@pytest.mark.parametrize("mutation", ["extra_id", "wrong_count"])
+def test_pitch_bend_count_is_derived_from_vocabulary_tokens(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    corpus = _make_synthetic_corpus(tmp_path)
+    _add_valid_guitar_metadata(corpus)
+    record, payload, sequence_path = _first_sequence(corpus)
+    if mutation == "extra_id":
+        payload["ids"].insert(-1, corpus.pitch_bend_ids[1])
+    else:
+        record["num_pitch_bend_tokens"] += 1
+    _publish_sequence_change(corpus, record, payload, sequence_path)
+
+    with pytest.raises(DatasetContractError, match="num_pitch_bend_tokens"):
+        TokenizedSequenceDataset(corpus.manifest_path, "train")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("technique_total", "techniques.total_tokens"),
+        ("technique_type", "by_type.DEAD_NOTE"),
+        ("coverage", "techniques.coverage"),
+        ("pitch_total", "pitch_bends"),
+        ("pitch_sequences", "pitch_bends"),
+        ("unknown", "unknown field"),
+    ],
+)
+def test_schema_two_summary_is_recomputed_strictly(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    corpus = _make_synthetic_corpus(tmp_path)
+    _add_valid_guitar_metadata(corpus)
+    summary = corpus.manifest["summary"]
+    if mutation == "technique_total":
+        summary["techniques"]["total_tokens"] += 1
+    elif mutation == "technique_type":
+        summary["techniques"]["by_type"]["DEAD_NOTE"] += 1
+    elif mutation == "coverage":
+        summary["techniques"]["coverage"]["complete_sequences"] += 1
+    elif mutation == "pitch_total":
+        summary["pitch_bends"]["total_tokens"] += 1
+    elif mutation == "pitch_sequences":
+        summary["pitch_bends"]["sequences_with_pitch_bends"] += 1
+    elif mutation == "unknown":
+        summary["techniques"]["unexpected"] = 0
+    else:  # pragma: no cover
+        raise AssertionError(mutation)
+    corpus.write_manifest()
+
+    with pytest.raises(DatasetContractError, match=message):
+        TokenizedSequenceDataset(corpus.manifest_path, "train")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("payload_schema", "schema_version 2"),
+        ("payload_missing", "missing field"),
+        ("record_missing", "missing field"),
+    ],
+)
+def test_sequence_schema_two_requires_all_new_fields(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    corpus = _make_synthetic_corpus(tmp_path)
+    record, payload, sequence_path = _first_sequence(corpus)
+    if mutation == "payload_schema":
+        payload["schema_version"] = 1
+    elif mutation == "payload_missing":
+        payload.pop("technique_coverage")
+    elif mutation == "record_missing":
+        record.pop("num_pitch_bend_tokens")
+    else:  # pragma: no cover
+        raise AssertionError(mutation)
+    if mutation == "record_missing":
+        corpus.write_manifest()
+    else:
+        _publish_sequence_change(corpus, record, payload, sequence_path)
+
+    with pytest.raises(DatasetContractError, match=message):
+        TokenizedSequenceDataset(corpus.manifest_path, "train")

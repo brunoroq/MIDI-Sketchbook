@@ -31,7 +31,9 @@ class ValidationConfig:
     pitch_max: int = 108
     allowed_time_signature: tuple[int, int] = (4, 4)
     allow_missing_time_signature: bool = True
-    reject_pitch_bends: bool = True
+    reject_pitch_bends: bool = False
+    canonical_pitch_bend_range_semitones: int = 6
+    require_explicit_pitch_bend_range: bool = True
     exclude_drums: bool = True
     min_notes_per_track: int = 1
     tempo_tolerance: float = 0.01
@@ -225,6 +227,8 @@ def _load_validation(root: Mapping[str, Any]) -> ValidationConfig:
         "allowed_time_signature",
         "allow_missing_time_signature",
         "reject_pitch_bends",
+        "canonical_pitch_bend_range_semitones",
+        "require_explicit_pitch_bend_range",
         "exclude_drums",
         "min_notes_per_track",
         "tempo_tolerance",
@@ -246,7 +250,15 @@ def _load_validation(root: Mapping[str, Any]) -> ValidationConfig:
             "validation.allow_missing_time_signature",
         ),
         reject_pitch_bends=_as_bool(
-            values.get("reject_pitch_bends", True), "validation.reject_pitch_bends"
+            values.get("reject_pitch_bends", False), "validation.reject_pitch_bends"
+        ),
+        canonical_pitch_bend_range_semitones=_as_int(
+            values.get("canonical_pitch_bend_range_semitones", 6),
+            "validation.canonical_pitch_bend_range_semitones",
+        ),
+        require_explicit_pitch_bend_range=_as_bool(
+            values.get("require_explicit_pitch_bend_range", True),
+            "validation.require_explicit_pitch_bend_range",
         ),
         exclude_drums=_as_bool(
             values.get("exclude_drums", True), "validation.exclude_drums"
@@ -267,8 +279,18 @@ def _load_validation(root: Mapping[str, Any]) -> ValidationConfig:
         raise ConfigError("'validation.min_notes_per_track' must be positive.")
     if config.tempo_tolerance < 0:
         raise ConfigError("'validation.tempo_tolerance' cannot be negative.")
-    if not config.reject_pitch_bends:
-        raise ConfigError("The stage-one MVP requires 'reject_pitch_bends: true'.")
+    if config.reject_pitch_bends:
+        raise ConfigError(
+            "Stage 1 pitch-bend support requires 'reject_pitch_bends: false'."
+        )
+    if config.canonical_pitch_bend_range_semitones != 6:
+        raise ConfigError(
+            "Stage 1 requires 'canonical_pitch_bend_range_semitones: 6'."
+        )
+    if not config.require_explicit_pitch_bend_range:
+        raise ConfigError(
+            "Stage 1 requires 'require_explicit_pitch_bend_range: true'."
+        )
     if not config.exclude_drums:
         raise ConfigError("The stage-one MVP requires 'exclude_drums: true'.")
     return config

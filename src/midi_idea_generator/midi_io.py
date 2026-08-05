@@ -6,6 +6,7 @@ import copy
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 import logging
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -22,7 +23,10 @@ LOGGER = logging.getLogger(__name__)
 MIDI_EXTENSIONS = {".mid", ".midi"}
 _DURATION_ATTRIBUTE = "_midi_idea_duration_seconds"
 _GUITAR_PRO_PITCH_BEND_RANGE_RPN = ((101, 0), (100, 0), (6, 6))
+_PITCH_BEND_RPN_CONTROLLERS = {6, 38, 100, 101}
 _EVENT_TIME_TOLERANCE_SECONDS = 1e-9
+PITCH_BEND_MIN = -8192
+PITCH_BEND_MAX = 8191
 
 
 class MidiReadError(ValueError):
@@ -86,6 +90,9 @@ class TrackInspection:
     min_pitch: int | None
     max_pitch: int | None
     has_pitch_bends: bool
+    num_pitch_bend_events: int
+    num_expressive_pitch_bend_events: int
+    source_pitch_bend_range_semitones: float | None
     valid: bool
     issues: tuple[str, ...]
 
@@ -216,19 +223,74 @@ def _validate_note_lifetimes(raw_midi: mido.MidiFile, midi_path: Path) -> None:
                 _raise_overlapping_notes(midi_path, track_number)
 
 
-def _is_guitar_pro_pitch_bend_range_setup(
+def detect_pitch_bend_range(
     control_changes: list[pretty_midi.ControlChange],
-) -> bool:
-    """Recognize Guitar Pro's inert, time-zero pitch-bend range RPN."""
+) -> tuple[float | None, str | None]:
+    """Return one explicit constant Pitch Bend Sensitivity RPN.
 
-    return (
-        tuple(sorted((change.number, change.value) for change in control_changes))
-        == tuple(sorted(_GUITAR_PRO_PITCH_BEND_RANGE_RPN))
-        and all(
-            abs(change.time) <= _EVENT_TIME_TOLERANCE_SECONDS
-            for change in control_changes
-        )
+    Stage 1 deliberately accepts no other controllers. Ordering is significant:
+    Data Entry must follow an RPN 0,0 selection. Repeated declarations are
+    accepted only when they describe the same range.
+    """
+
+    if not control_changes:
+        return None, None
+    ordered = sorted(
+        enumerate(control_changes),
+        key=lambda item: (float(item[1].time), item[0]),
     )
+    rpn_msb: int | None = None
+    rpn_lsb: int | None = None
+    ranges: list[float] = []
+    latest_range_index: int | None = None
+    for _, change in ordered:
+        if (
+            not np.isfinite(change.time)
+            or change.time < -_EVENT_TIME_TOLERANCE_SECONDS
+        ):
+            return None, "Pitch-bend RPN contains invalid timing"
+        number = int(change.number)
+        value = int(change.value)
+        if number not in _PITCH_BEND_RPN_CONTROLLERS:
+            return None, "Track contains unsupported MIDI control changes"
+        if number == 101:
+            rpn_msb = value
+            latest_range_index = None
+        elif number == 100:
+            rpn_lsb = value
+            latest_range_index = None
+        elif number == 6:
+            if (rpn_msb, rpn_lsb) != (0, 0):
+                return None, "Pitch-bend Data Entry appears before RPN 0,0 selection"
+            if value <= 0:
+                return None, "Pitch-bend range must be positive"
+            ranges.append(float(value))
+            latest_range_index = len(ranges) - 1
+        else:  # CC38: optional cents for the latest Data Entry MSB.
+            if (rpn_msb, rpn_lsb) != (0, 0) or latest_range_index is None:
+                return None, "Pitch-bend fine range appears without Data Entry MSB"
+            coarse = math.floor(ranges[latest_range_index])
+            ranges[latest_range_index] = coarse + value / 100.0
+
+    if not ranges:
+        return None, "Pitch-bend RPN selection has no range Data Entry"
+    first = ranges[0]
+    if any(not math.isclose(value, first, abs_tol=1e-9) for value in ranges[1:]):
+        return None, "Pitch-bend range changes within the track"
+    return first, None
+
+
+def canonical_pitch_bend_range_controls(
+    semitones: int = 6,
+) -> list[pretty_midi.ControlChange]:
+    """Create the ordered time-zero RPN for a canonical integer range."""
+
+    if semitones != 6:
+        raise ValueError("Stage 1 supports only a canonical +/-6-semitone range")
+    return [
+        pretty_midi.ControlChange(number=number, value=value, time=0.0)
+        for number, value in _GUITAR_PRO_PITCH_BEND_RANGE_RPN
+    ]
 
 
 def read_midi(path: str | Path) -> pretty_midi.PrettyMIDI:
@@ -352,6 +414,21 @@ def _canonical_midi(midi: pretty_midi.PrettyMIDI) -> tuple[Any, ...]:
                         for note in instrument.notes
                     )
                 ),
+                tuple(
+                    (
+                        int(midi.time_to_tick(float(bend.time))),
+                        int(bend.pitch),
+                    )
+                    for bend in instrument.pitch_bends
+                ),
+                tuple(
+                    (
+                        int(midi.time_to_tick(float(change.time))),
+                        int(change.number),
+                        int(change.value),
+                    )
+                    for change in instrument.control_changes
+                ),
             )
             for instrument in midi.instruments
         )
@@ -396,7 +473,9 @@ def _write_structural_end_time(
     target_tick = int(midi.time_to_tick(get_midi_duration_seconds(midi)))
     raw_midi = mido.MidiFile(filename=str(path), clip=False)
     conductor_track = raw_midi.tracks[0]
-    messages = [message for message in conductor_track if message.type != "end_of_track"]
+    messages = [
+        message for message in conductor_track if message.type != "end_of_track"
+    ]
     current_tick = sum(int(message.time) for message in messages)
     messages.append(
         mido.MetaMessage(
@@ -408,12 +487,56 @@ def _write_structural_end_time(
     raw_midi.save(path)
 
 
+def _order_channel_events(path: Path) -> None:
+    """Repair pretty_midi's same-tick ordering for pitch-bend RPN events."""
+
+    raw_midi = mido.MidiFile(filename=str(path), clip=False)
+
+    def priority(message: mido.Message | mido.MetaMessage) -> int:
+        if message.type == "track_name":
+            return 0
+        if message.type == "program_change":
+            return 10
+        if message.type == "control_change":
+            controller_priority = {101: 20, 100: 21, 6: 22, 38: 23}
+            return controller_priority.get(message.control, 40)
+        if message.type == "pitchwheel":
+            return 30
+        return 50
+
+    for track in raw_midi.tracks:
+        absolute_tick = 0
+        events: list[tuple[int, int, mido.Message | mido.MetaMessage]] = []
+        for event_index, message in enumerate(track):
+            absolute_tick += int(message.time)
+            events.append((absolute_tick, event_index, message.copy(time=0)))
+        events.sort(key=lambda item: (item[0], priority(item[2]), item[1]))
+        previous_tick = 0
+        rebuilt = mido.MidiTrack()
+        for event_tick, _, message in events:
+            rebuilt.append(message.copy(time=event_tick - previous_tick))
+            previous_tick = event_tick
+        track[:] = rebuilt
+    raw_midi.save(path)
+
+
 def write_midi(midi: pretty_midi.PrettyMIDI, path: str | Path) -> Path:
     """Validate and atomically write a MIDI file."""
 
     output_path = Path(path).expanduser().resolve()
     temporary_path: Path | None = None
     try:
+        for instrument in midi.instruments:
+            expressive = [bend for bend in instrument.pitch_bends if bend.pitch != 0]
+            bend_range, range_issue = detect_pitch_bend_range(
+                instrument.control_changes
+            )
+            if expressive and (range_issue is not None or bend_range != 6.0):
+                detail = range_issue or f"range is {bend_range}, expected 6"
+                raise ValueError(
+                    "Expressive pitch bends require a constant explicit "
+                    f"+/-6-semitone RPN ({detail})"
+                )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{output_path.stem}-",
@@ -423,6 +546,7 @@ def write_midi(midi: pretty_midi.PrettyMIDI, path: str | Path) -> Path:
         os.close(descriptor)
         temporary_path = Path(temporary_name)
         midi.write(str(temporary_path))
+        _order_channel_events(temporary_path)
         _write_structural_end_time(temporary_path, midi)
         reparsed = read_midi(temporary_path)
         if not _round_trip_matches(midi, reparsed):
@@ -526,12 +650,57 @@ def inspect_track(
     expressive_pitch_bends = [
         bend for bend in instrument.pitch_bends if bend.pitch != 0
     ]
+    bend_range, bend_range_issue = detect_pitch_bend_range(
+        instrument.control_changes
+    )
     if config.reject_pitch_bends and expressive_pitch_bends:
         issues.append("Track contains pitch bends")
-    if instrument.control_changes and not _is_guitar_pro_pitch_bend_range_setup(
-        instrument.control_changes
+    if bend_range_issue is not None:
+        issues.append(bend_range_issue)
+    if (
+        expressive_pitch_bends
+        and config.require_explicit_pitch_bend_range
+        and bend_range is None
     ):
-        issues.append("Track contains unsupported MIDI control changes")
+        issues.append("Expressive pitch bends require an explicit range RPN")
+    if expressive_pitch_bends and bend_range is not None:
+        range_setup_times = [
+            float(change.time)
+            for change in instrument.control_changes
+            if change.number == 6
+        ]
+        first_expressive_time = min(
+            float(bend.time) for bend in expressive_pitch_bends
+        )
+        if (
+            not range_setup_times
+            or min(range_setup_times)
+            > first_expressive_time + _EVENT_TIME_TOLERANCE_SECONDS
+        ):
+            issues.append("Pitch-bend range is declared after the expressive curve")
+    if expressive_pitch_bends and bend_range is not None:
+        canonical_range = config.canonical_pitch_bend_range_semitones
+        if any(
+            abs(int(bend.pitch) * bend_range / 8192.0)
+            > canonical_range + 1e-9
+            for bend in expressive_pitch_bends
+        ):
+            issues.append(
+                "Pitch-bend excursion exceeds the canonical "
+                f"+/-{canonical_range}-semitone range"
+            )
+    invalid_bends = sum(
+        1
+        for bend in instrument.pitch_bends
+        if bend.pitch < PITCH_BEND_MIN
+        or bend.pitch > PITCH_BEND_MAX
+        or bend.time < 0
+        or not np.isfinite(bend.time)
+    )
+    if invalid_bends:
+        issues.append(
+            f"Track contains {invalid_bends} pitch-bend event(s) with invalid values"
+        )
     invalid_notes = sum(
         1
         for note in notes
@@ -552,6 +721,9 @@ def inspect_track(
         min_pitch=minimum,
         max_pitch=maximum,
         has_pitch_bends=bool(expressive_pitch_bends),
+        num_pitch_bend_events=len(instrument.pitch_bends),
+        num_expressive_pitch_bend_events=len(expressive_pitch_bends),
+        source_pitch_bend_range_semitones=bend_range,
         valid=not issues,
         issues=tuple(issues),
     )

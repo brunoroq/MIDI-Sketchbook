@@ -36,6 +36,24 @@ tokenizer:
   tempo_min: 40
   tempo_max: 250
 
+  # Preserve expressive pitch-wheel curves. A symmetric 65-bin range is used
+  # instead of MidiTok's asymmetric default so neutral resets have an exact
+  # PitchBend_0 token. Guitar Pro exports in this corpus declare a six-semitone
+  # pitch-bend sensitivity; generated MIDI must restore the same RPN setting.
+  use_pitch_bends: true
+  pitch_bend_range: [-8191, 8191, 65]
+  pitch_bend_sensitivity_semitones: 6
+
+  # These are ordinary musical tokens, not MidiTok special tokens. They are
+  # serialized directly after the Duration of the note they describe.
+  technique_tokens:
+    - Technique_DEAD-NOTE
+    - Technique_PALM-MUTE-ON
+    - Technique_PALM-MUTE-OFF
+    - Technique_SLIDE-UP
+    - Technique_SLIDE-DOWN
+    - Technique_VIBRATO
+
   # Keep a terminal Bar event so phrase endings survive encode/decode cleanly.
   add_trailing_bars: true
   max_bar_embedding: null

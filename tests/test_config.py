@@ -69,6 +69,9 @@ def test_load_config_resolves_relative_paths_from_nearest_project_root(
     ).resolve()
     assert config.random_seed == 17
     assert config.validation.pitch_min == 21
+    assert config.validation.reject_pitch_bends is False
+    assert config.validation.canonical_pitch_bend_range_semitones == 6
+    assert config.validation.require_explicit_pitch_bend_range is True
     assert config.preprocessing.phrase_bars == 4
     assert config.splits.train == pytest.approx(0.8)
 
@@ -84,7 +87,21 @@ def test_load_config_resolves_relative_paths_from_nearest_project_root(
             "only supports a 4/4 time signature",
         ),
         ("validation.tempo_tolerance", -0.01, "cannot be negative"),
-        ("validation.reject_pitch_bends", False, "requires 'reject_pitch_bends: true'"),
+        (
+            "validation.reject_pitch_bends",
+            True,
+            "requires 'reject_pitch_bends: false'",
+        ),
+        (
+            "validation.canonical_pitch_bend_range_semitones",
+            5,
+            "requires 'canonical_pitch_bend_range_semitones: 6'",
+        ),
+        (
+            "validation.require_explicit_pitch_bend_range",
+            False,
+            "requires 'require_explicit_pitch_bend_range: true'",
+        ),
         ("validation.exclude_drums", False, "requires 'exclude_drums: true'"),
         ("track_selection.mode", "index", "track_index.*is required"),
         ("preprocessing.phrase_bars", 3, "must be 2, 4, or 8"),

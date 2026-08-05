@@ -8,21 +8,69 @@ pipeline.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+import json
 import math
 from numbers import Integral
 from pathlib import Path
 from typing import Any
 
-from miditok import REMI, TokSequence, TokenizerConfig
+from miditok import Event, REMI, TokSequence, TokenizerConfig
 from symusic import Score
 
-from .tokenization_config import RemiTokenizerConfig
+from .tokenization_config import (
+    GUITAR_TECHNIQUE_TOKENS,
+    PITCH_BEND_RANGE,
+    PITCH_BEND_SENSITIVITY_SEMITONES,
+    RemiTokenizerConfig,
+)
+
+
+TECHNIQUE_TYPES: tuple[str, ...] = (
+    "DEAD_NOTE",
+    "PALM_MUTE_ON",
+    "PALM_MUTE_OFF",
+    "SLIDE_UP",
+    "SLIDE_DOWN",
+    "VIBRATO",
+)
+TECHNIQUE_TOKEN_BY_TYPE: dict[str, str] = dict(
+    zip(TECHNIQUE_TYPES, GUITAR_TECHNIQUE_TOKENS, strict=True)
+)
+TECHNIQUE_TYPE_BY_TOKEN: dict[str, str] = {
+    token: technique_type
+    for technique_type, token in TECHNIQUE_TOKEN_BY_TYPE.items()
+}
+_TECHNIQUE_ORDER = {
+    technique_type: index for index, technique_type in enumerate(TECHNIQUE_TYPES)
+}
+_TECHNIQUE_SCHEMA_VERSION = 1
 
 
 class TokenizationError(ValueError):
     """Raised when a MIDI cannot satisfy the Stage 2 token contract."""
+
+
+class GuitarREMI(REMI):
+    """REMI extended with postfix tokens for note-level guitar techniques."""
+
+    def _create_base_vocabulary(self) -> list[str]:
+        vocabulary = super()._create_base_vocabulary()
+        vocabulary.extend(GUITAR_TECHNIQUE_TOKENS)
+        return vocabulary
+
+    def _create_token_types_graph(self) -> dict[str, set[str]]:
+        graph = super()._create_token_types_graph()
+        if "Duration" not in graph:
+            raise TokenizationError(
+                "GuitarREMI requires Duration tokens for postfix techniques."
+            )
+        duration_successors = set(graph["Duration"])
+        graph["Duration"].add("Technique")
+        graph["Technique"] = duration_successors | {"Technique"}
+        return graph
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +83,22 @@ class SpecialTokenIds:
 
 
 @dataclass(frozen=True, slots=True)
+class TechniqueAnnotation:
+    """One canonical technique attached to a processed note by stable index."""
+
+    type: str
+    note_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class DecodedMidi:
+    """Decoded score together with technique information MIDI cannot express."""
+
+    score: Score
+    techniques: tuple[TechniqueAnnotation, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class EncodedMidi:
     """One verified single-track MIDI represented as REMI identifiers."""
 
@@ -42,6 +106,8 @@ class EncodedMidi:
     musical_ids: tuple[int, ...]
     programs: tuple[tuple[int, bool], ...]
     num_notes: int
+    num_pitch_bends: int
+    techniques: tuple[TechniqueAnnotation, ...]
     token_error_ratio: float
     round_trip_ok: bool
 
@@ -58,7 +124,7 @@ class EncodedMidi:
         return len(self.musical_ids)
 
 
-def build_tokenizer(config: RemiTokenizerConfig) -> REMI:
+def build_tokenizer(config: RemiTokenizerConfig) -> GuitarREMI:
     """Build the deterministic, single-track REMI vocabulary for Stage 2.
 
     MidiTok 3.0.6.post1 builds pitch tokens for both configured endpoints, so
@@ -67,6 +133,24 @@ def build_tokenizer(config: RemiTokenizerConfig) -> REMI:
     explicitly here so that a library-default change cannot silently alter
     the vocabulary.
     """
+
+    if not config.use_pitch_bends:
+        raise TokenizationError("GuitarREMI requires native PitchBend tokens.")
+    if config.pitch_bend_range != PITCH_BEND_RANGE:
+        raise TokenizationError(
+            f"GuitarREMI requires pitch_bend_range={PITCH_BEND_RANGE}."
+        )
+    if (
+        config.pitch_bend_sensitivity_semitones
+        != PITCH_BEND_SENSITIVITY_SEMITONES
+    ):
+        raise TokenizationError(
+            "GuitarREMI requires a six-semitone pitch-bend sensitivity."
+        )
+    if config.technique_tokens != GUITAR_TECHNIQUE_TOKENS:
+        raise TokenizationError(
+            "GuitarREMI requires the canonical guitar-technique vocabulary."
+        )
 
     beat_res = {
         (entry.start_beat, entry.end_beat): entry.resolution
@@ -84,12 +168,13 @@ def build_tokenizer(config: RemiTokenizerConfig) -> REMI:
         use_tempos=config.use_tempos,
         use_time_signatures=False,
         use_sustain_pedals=False,
-        use_pitch_bends=False,
+        use_pitch_bends=config.use_pitch_bends,
         use_programs=False,
         use_pitch_intervals=False,
         use_pitchdrum_tokens=False,
         num_tempos=config.num_tempos,
         tempo_range=(config.tempo_min, config.tempo_max),
+        pitch_bend_range=config.pitch_bend_range,
         remove_duplicated_notes=True,
         delete_equal_successive_tempo_changes=True,
         one_token_stream_for_programs=False,
@@ -98,7 +183,7 @@ def build_tokenizer(config: RemiTokenizerConfig) -> REMI:
         use_bar_end_tokens=False,
     )
     try:
-        tokenizer = REMI(
+        tokenizer = GuitarREMI(
             tokenizer_config=tokenizer_config,
             max_bar_embedding=config.max_bar_embedding,
         )
@@ -110,7 +195,12 @@ def build_tokenizer(config: RemiTokenizerConfig) -> REMI:
             "Stage 2 requires independent instrument streams, but MidiTok "
             "configured a merged token stream."
         )
-    get_special_token_ids(tokenizer)
+    tokenizer.guitar_technique_schema_version = _TECHNIQUE_SCHEMA_VERSION
+    tokenizer.guitar_technique_tokens = list(GUITAR_TECHNIQUE_TOKENS)
+    tokenizer.pitch_bend_sensitivity_semitones = (
+        config.pitch_bend_sensitivity_semitones
+    )
+    _validate_guitar_tokenizer(tokenizer)
     return tokenizer
 
 
@@ -136,13 +226,34 @@ def get_special_token_ids(tokenizer: REMI) -> SpecialTokenIds:
     return special_ids
 
 
-def encode_midi(tokenizer: REMI, path: str | Path) -> EncodedMidi:
-    """Encode one single-track MIDI and verify a loss-aware round trip.
+def get_technique_token_ids(tokenizer: REMI) -> dict[str, int]:
+    """Resolve canonical technique aliases to ordinary vocabulary identifiers."""
 
-    Velocity and timing can be intentionally quantized by the tokenizer
-    configuration.  The musical event identity checked here is therefore the
-    note count and pitch multiset, followed by exact idempotence of the REMI
-    content IDs after decoding and re-encoding.
+    vocabulary = _vocabulary(tokenizer)
+    resolved: dict[str, int] = {}
+    for technique_type, token in TECHNIQUE_TOKEN_BY_TYPE.items():
+        token_id = vocabulary.get(token)
+        if isinstance(token_id, bool) or not isinstance(token_id, Integral):
+            raise TokenizationError(
+                f"The tokenizer vocabulary does not define technique token '{token}'."
+            )
+        resolved[technique_type] = int(token_id)
+    if len(set(resolved.values())) != len(resolved):
+        raise TokenizationError("Guitar technique tokens must have distinct IDs.")
+    return resolved
+
+
+def encode_midi(
+    tokenizer: REMI,
+    path: str | Path,
+    *,
+    techniques: Sequence[TechniqueAnnotation | Mapping[str, object]] = (),
+) -> EncodedMidi:
+    """Encode one single-track MIDI plus lossless symbolic guitar techniques.
+
+    Bends remain native MidiTok ``PitchBend`` events. Techniques not expressible
+    in MIDI are supplied by the authoritative Stage 1 manifest and serialized
+    immediately after the ``Duration`` belonging to their note.
     """
 
     midi_path = Path(path).expanduser().resolve()
@@ -157,9 +268,34 @@ def encode_midi(tokenizer: REMI, path: str | Path) -> EncodedMidi:
         ) from exc
 
     track, note_pitches = _validated_single_track(score, source=str(midi_path))
+    normalized_techniques = _normalize_techniques(
+        techniques, num_notes=len(track.notes), source=str(midi_path)
+    )
     programs = ((int(track.program), bool(track.is_drum)),)
 
-    sequence = _encode_single_sequence(tokenizer, score, source=str(midi_path))
+    preprocessed = _preprocess_score(tokenizer, score, source=str(midi_path))
+    preprocessed_track, _ = _validated_single_track(
+        preprocessed, source=f"preprocessed representation of '{midi_path}'"
+    )
+    note_mapping = _map_note_indices_after_preprocessing(
+        track,
+        preprocessed_track,
+        normalized_techniques,
+        source=str(midi_path),
+    )
+    sequence = _encode_single_sequence(
+        tokenizer,
+        preprocessed,
+        source=str(midi_path),
+        no_preprocess_score=True,
+    )
+    sequence = _insert_technique_events(
+        tokenizer,
+        sequence,
+        normalized_techniques,
+        note_mapping,
+        source=str(midi_path),
+    )
     musical_ids = _validated_musical_ids(tokenizer, sequence.ids)
     error_ratio = _token_error_ratio(tokenizer, sequence)
     if error_ratio != 0.0:
@@ -173,21 +309,26 @@ def encode_midi(tokenizer: REMI, path: str | Path) -> EncodedMidi:
     if special_ids.pad in ids:
         raise TokenizationError("PAD must never be stored in an encoded MIDI.")
 
-    decoded = decode_token_ids(tokenizer, ids, programs)
-    _, decoded_pitches = _validated_single_track(
-        decoded, source=f"decoded representation of '{midi_path}'"
+    decoded = decode_symbolic_token_ids(tokenizer, ids, programs)
+    decoded_track, decoded_pitches = _validated_single_track(
+        decoded.score, source=f"decoded representation of '{midi_path}'"
     )
     if decoded_pitches != note_pitches:
         raise TokenizationError(
             f"REMI round trip changed the note count or pitches for '{midi_path}'."
         )
+    if decoded.techniques != normalized_techniques:
+        raise TokenizationError(
+            f"REMI round trip changed guitar techniques for '{midi_path}'."
+        )
 
-    round_trip_sequence = _encode_single_sequence(
-        tokenizer, decoded, source=f"decoded representation of '{midi_path}'"
+    round_trip_sequence = _encode_score_with_techniques(
+        tokenizer,
+        decoded.score,
+        decoded.techniques,
+        source=f"decoded representation of '{midi_path}'",
     )
-    round_trip_ids = _validated_musical_ids(
-        tokenizer, round_trip_sequence.ids
-    )
+    round_trip_ids = _validated_musical_ids(tokenizer, round_trip_sequence.ids)
     round_trip_error_ratio = _token_error_ratio(tokenizer, round_trip_sequence)
     if round_trip_error_ratio != 0.0:
         raise TokenizationError(
@@ -204,9 +345,59 @@ def encode_midi(tokenizer: REMI, path: str | Path) -> EncodedMidi:
         musical_ids=musical_ids,
         programs=programs,
         num_notes=len(note_pitches),
+        num_pitch_bends=len(decoded_track.pitch_bends),
+        techniques=normalized_techniques,
         token_error_ratio=error_ratio,
         round_trip_ok=True,
     )
+
+
+def decode_symbolic_token_ids(
+    tokenizer: REMI,
+    token_ids: Sequence[int],
+    programs: Sequence[tuple[int, bool]],
+) -> DecodedMidi:
+    """Decode stored IDs while retaining postfix guitar-technique annotations."""
+
+    musical_ids = _validated_stored_ids(tokenizer, token_ids)
+    normalized_programs = _normalize_programs(programs)
+    sequence = TokSequence(ids=list(musical_ids))
+    try:
+        tokenizer.complete_sequence(sequence)
+    except Exception as exc:
+        raise TokenizationError(f"Could not resolve REMI token IDs: {exc}") from exc
+    error_ratio = _token_error_ratio(tokenizer, sequence)
+    if error_ratio != 0.0:
+        raise TokenizationError(
+            f"Stored REMI token sequence has an error ratio of {error_ratio:g}."
+        )
+
+    try:
+        score = tokenizer.decode(
+            [list(musical_ids)], programs=list(normalized_programs)
+        )
+    except Exception as exc:
+        raise TokenizationError(f"Could not decode REMI token IDs: {exc}") from exc
+    track, _ = _validated_single_track(score, source="decoded token sequence")
+
+    tokens = tuple(str(token) for token in sequence.tokens)
+    base_tokens = tuple(
+        token for token in tokens if token not in TECHNIQUE_TYPE_BY_TOKEN
+    )
+    base_sequence = _encode_single_sequence(
+        tokenizer,
+        score,
+        source="decoded token sequence",
+        no_preprocess_score=True,
+    )
+    if tuple(base_sequence.tokens) != base_tokens:
+        raise TokenizationError(
+            "REMI content without technique tokens is not idempotent after decoding."
+        )
+    techniques = _extract_postfix_techniques(
+        tokens, base_sequence, track, source="decoded token sequence"
+    )
+    return DecodedMidi(score=score, techniques=techniques)
 
 
 def decode_token_ids(
@@ -214,38 +405,9 @@ def decode_token_ids(
     token_ids: Sequence[int],
     programs: Sequence[tuple[int, bool]],
 ) -> Score:
-    """Decode one stored Stage 2 sequence after removing BOS and EOS.
+    """Compatibility wrapper returning only the MIDI-representable score."""
 
-    Stored sequences must contain exactly one BOS/EOS boundary pair and no PAD
-    token.  ``programs`` remains out-of-band because program tokens are
-    deliberately disabled for this single-instrument experiment.
-    """
-
-    ids = _normalize_ids(token_ids, name="token IDs")
-    special_ids = get_special_token_ids(tokenizer)
-    if len(ids) < 3:
-        raise TokenizationError(
-            "A stored token sequence must contain BOS, musical content, and EOS."
-        )
-    if ids[0] != special_ids.bos or ids[-1] != special_ids.eos:
-        raise TokenizationError(
-            "A stored token sequence must begin with BOS and end with EOS."
-        )
-    if special_ids.pad in ids:
-        raise TokenizationError("PAD is only for batching and cannot be decoded.")
-    if special_ids.bos in ids[1:] or special_ids.eos in ids[:-1]:
-        raise TokenizationError("BOS and EOS may only occur at sequence boundaries.")
-
-    musical_ids = _validated_musical_ids(tokenizer, ids[1:-1])
-    normalized_programs = _normalize_programs(programs)
-    try:
-        score = tokenizer.decode(
-            [list(musical_ids)], programs=list(normalized_programs)
-        )
-    except Exception as exc:
-        raise TokenizationError(f"Could not decode REMI token IDs: {exc}") from exc
-    _validated_single_track(score, source="decoded token sequence")
-    return score
+    return decode_symbolic_token_ids(tokenizer, token_ids, programs).score
 
 
 def save_tokenizer(
@@ -259,15 +421,53 @@ def save_tokenizer(
     output_path = Path(path).expanduser().resolve()
     if output_path.suffix.lower() != ".json":
         raise TokenizationError("Tokenizer output path must use a .json extension.")
+    attributes = (
+        dict(additional_attributes) if additional_attributes is not None else {}
+    )
+    protected_serialization_fields = {
+        "_model",
+        "_vocab_base",
+        "_vocab_base_byte_to_token",
+        "config",
+        "hf_tokenizers_version",
+        "miditok_version",
+        "symusic_version",
+        "tokenization",
+    }
+    protected_overrides = sorted(
+        protected_serialization_fields.intersection(attributes)
+    )
+    if protected_overrides:
+        raise TokenizationError(
+            "Additional tokenizer attributes cannot override serialization field(s): "
+            + ", ".join(protected_overrides)
+            + "."
+        )
+    if isinstance(tokenizer, GuitarREMI):
+        reserved = {
+            "guitar_technique_schema_version": _TECHNIQUE_SCHEMA_VERSION,
+            "guitar_technique_tokens": list(GUITAR_TECHNIQUE_TOKENS),
+            "pitch_bend_sensitivity_semitones": (
+                PITCH_BEND_SENSITIVITY_SEMITONES
+            ),
+        }
+        conflicts = sorted(
+            key
+            for key, value in reserved.items()
+            if key in attributes and attributes[key] != value
+        )
+        if conflicts:
+            raise TokenizationError(
+                "Additional tokenizer attributes cannot override reserved field(s): "
+                + ", ".join(conflicts)
+                + "."
+            )
+        attributes = {**reserved, **attributes}
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         tokenizer.save(
             output_path,
-            additional_attributes=(
-                dict(additional_attributes)
-                if additional_attributes is not None
-                else None
-            ),
+            additional_attributes=attributes or None,
         )
     except Exception as exc:
         raise TokenizationError(
@@ -287,7 +487,18 @@ def load_tokenizer(path: str | Path) -> REMI:
     if not tokenizer_path.is_file():
         raise TokenizationError(f"Tokenizer file does not exist: {tokenizer_path}")
     try:
-        tokenizer = REMI(params=tokenizer_path)
+        payload = json.loads(tokenizer_path.read_bytes())
+        if not isinstance(payload, Mapping):
+            raise TypeError("tokenizer JSON root is not an object")
+        tokenization = payload.get("tokenization")
+        if tokenization == "GuitarREMI":
+            tokenizer = GuitarREMI(params=tokenizer_path)
+        elif tokenization == "REMI":
+            tokenizer = REMI(params=tokenizer_path)
+        else:
+            raise ValueError(
+                "tokenization must be 'GuitarREMI' or legacy 'REMI'"
+            )
     except Exception as exc:
         raise TokenizationError(
             f"Could not load tokenizer '{tokenizer_path}': {exc}"
@@ -298,6 +509,8 @@ def load_tokenizer(path: str | Path) -> REMI:
             "does not support."
         )
     get_special_token_ids(tokenizer)
+    if isinstance(tokenizer, GuitarREMI):
+        _validate_guitar_tokenizer(tokenizer)
     return tokenizer
 
 
@@ -306,6 +519,375 @@ def _vocabulary(tokenizer: REMI) -> Mapping[str, int]:
     if not isinstance(vocabulary, Mapping):
         raise TokenizationError("Stage 2 requires a single MidiTok vocabulary.")
     return vocabulary
+
+
+def _validate_guitar_tokenizer(tokenizer: GuitarREMI) -> None:
+    special_tokens = tuple(tokenizer.config.special_tokens)
+    if special_tokens != ("PAD_None", "BOS_None", "EOS_None"):
+        raise TokenizationError(
+            "GuitarREMI requires PAD, BOS, and EOS as its only special tokens."
+        )
+    if not tokenizer.config.use_pitch_bends:
+        raise TokenizationError("GuitarREMI must enable native PitchBend tokens.")
+    if tuple(tokenizer.config.pitch_bend_range) != PITCH_BEND_RANGE:
+        raise TokenizationError(
+            f"GuitarREMI pitch_bend_range must be {PITCH_BEND_RANGE}."
+        )
+    if 0 not in {int(value) for value in tokenizer.pitch_bends}:
+        raise TokenizationError("GuitarREMI pitch-bend vocabulary must contain zero.")
+    if (
+        getattr(tokenizer, "guitar_technique_schema_version", None)
+        != _TECHNIQUE_SCHEMA_VERSION
+    ):
+        raise TokenizationError("GuitarREMI technique schema metadata is missing.")
+    if tuple(getattr(tokenizer, "guitar_technique_tokens", ())) != (
+        GUITAR_TECHNIQUE_TOKENS
+    ):
+        raise TokenizationError("GuitarREMI technique vocabulary metadata is invalid.")
+    if (
+        getattr(tokenizer, "pitch_bend_sensitivity_semitones", None)
+        != PITCH_BEND_SENSITIVITY_SEMITONES
+    ):
+        raise TokenizationError(
+            "GuitarREMI pitch-bend sensitivity metadata must be six semitones."
+        )
+    get_special_token_ids(tokenizer)
+    get_technique_token_ids(tokenizer)
+
+
+def _normalize_techniques(
+    techniques: Sequence[TechniqueAnnotation | Mapping[str, object]],
+    *,
+    num_notes: int,
+    source: str,
+) -> tuple[TechniqueAnnotation, ...]:
+    if isinstance(techniques, (str, bytes)) or not isinstance(techniques, Sequence):
+        raise TokenizationError(f"Techniques for {source} must be a sequence.")
+
+    normalized: list[TechniqueAnnotation] = []
+    seen: set[tuple[int, str]] = set()
+    for index, value in enumerate(techniques):
+        name = f"techniques[{index}]"
+        if isinstance(value, TechniqueAnnotation):
+            technique_type = value.type
+            note_index = value.note_index
+        elif isinstance(value, Mapping):
+            if set(value) != {"type", "note_index"}:
+                raise TokenizationError(
+                    f"{name} must contain exactly 'type' and 'note_index'."
+                )
+            technique_type = value["type"]
+            note_index = value["note_index"]
+        else:
+            raise TokenizationError(
+                f"{name} must be a TechniqueAnnotation or mapping."
+            )
+        if not isinstance(technique_type, str) or technique_type not in (
+            TECHNIQUE_TOKEN_BY_TYPE
+        ):
+            raise TokenizationError(
+                f"{name}.type must be one of {', '.join(TECHNIQUE_TYPES)}."
+            )
+        if isinstance(note_index, bool) or not isinstance(note_index, Integral):
+            raise TokenizationError(f"{name}.note_index must be an integer.")
+        converted_index = int(note_index)
+        if not 0 <= converted_index < num_notes:
+            raise TokenizationError(
+                f"{name}.note_index {converted_index} is outside the "
+                f"{num_notes}-note track."
+            )
+        identity = (converted_index, technique_type)
+        if identity in seen:
+            raise TokenizationError(
+                f"Duplicate technique {technique_type} for note {converted_index}."
+            )
+        seen.add(identity)
+        normalized.append(TechniqueAnnotation(technique_type, converted_index))
+
+    normalized.sort(key=lambda item: (item.note_index, _TECHNIQUE_ORDER[item.type]))
+    grouped: dict[int, set[str]] = defaultdict(set)
+    for technique in normalized:
+        grouped[technique.note_index].add(technique.type)
+    for note_index, types in grouped.items():
+        if {"SLIDE_UP", "SLIDE_DOWN"}.issubset(types):
+            raise TokenizationError(
+                f"Note {note_index} cannot use SLIDE_UP and SLIDE_DOWN together."
+            )
+        if {"PALM_MUTE_ON", "PALM_MUTE_OFF"}.issubset(types):
+            raise TokenizationError(
+                f"Note {note_index} cannot switch palm mute on and off together."
+            )
+
+    palm_muted = False
+    for technique in normalized:
+        if technique.type == "PALM_MUTE_ON":
+            if palm_muted:
+                raise TokenizationError(
+                    f"PALM_MUTE_ON at note {technique.note_index} is redundant."
+                )
+            palm_muted = True
+        elif technique.type == "PALM_MUTE_OFF":
+            if not palm_muted:
+                raise TokenizationError(
+                    f"PALM_MUTE_OFF at note {technique.note_index} has no active mute."
+                )
+            palm_muted = False
+    return tuple(normalized)
+
+
+def _canonical_notes(track: Any) -> tuple[Any, ...]:
+    return tuple(
+        sorted(
+            track.notes,
+            key=lambda note: (
+                int(note.time),
+                int(note.pitch),
+                int(note.end),
+                int(note.velocity),
+            ),
+        )
+    )
+
+
+def _preprocess_score(tokenizer: REMI, score: Score, *, source: str) -> Score:
+    try:
+        return tokenizer.preprocess_score(score)
+    except Exception as exc:
+        raise TokenizationError(f"Could not preprocess {source}: {exc}") from exc
+
+
+def _map_note_indices_after_preprocessing(
+    original_track: Any,
+    preprocessed_track: Any,
+    techniques: Sequence[TechniqueAnnotation],
+    *,
+    source: str,
+) -> dict[int, Any]:
+    if not techniques:
+        return {}
+    original_notes = _canonical_notes(original_track)
+    by_pitch_original: dict[int, list[tuple[int, Any]]] = defaultdict(list)
+    for note_index, note in enumerate(original_notes):
+        by_pitch_original[int(note.pitch)].append((note_index, note))
+    by_pitch_preprocessed: dict[int, list[Any]] = defaultdict(list)
+    for note in preprocessed_track.notes:
+        by_pitch_preprocessed[int(note.pitch)].append(note)
+    for notes in by_pitch_preprocessed.values():
+        notes.sort(key=lambda note: (int(note.time), int(note.end), int(note.velocity)))
+
+    requested = {technique.note_index for technique in techniques}
+    mapping: dict[int, Any] = {}
+    for pitch, original_group in by_pitch_original.items():
+        original_group.sort(
+            key=lambda item: (
+                int(item[1].time),
+                int(item[1].end),
+                int(item[1].velocity),
+            )
+        )
+        preprocessed_group = by_pitch_preprocessed.get(pitch, [])
+        if len(original_group) != len(preprocessed_group):
+            if any(note_index in requested for note_index, _ in original_group):
+                raise TokenizationError(
+                    f"Tokenizer preprocessing removed or merged a technique-bearing "
+                    f"pitch {pitch} note in {source}."
+                )
+            continue
+        for (note_index, _), preprocessed_note in zip(
+            original_group, preprocessed_group, strict=True
+        ):
+            if note_index in requested:
+                mapping[note_index] = preprocessed_note
+    missing = sorted(requested - set(mapping))
+    if missing:
+        raise TokenizationError(
+            "Could not map technique-bearing note index(es) after preprocessing: "
+            + ", ".join(str(index) for index in missing)
+            + "."
+        )
+    return mapping
+
+
+def _insert_technique_events(
+    tokenizer: REMI,
+    sequence: TokSequence,
+    techniques: Sequence[TechniqueAnnotation],
+    note_mapping: Mapping[int, Any],
+    *,
+    source: str,
+) -> TokSequence:
+    if not techniques:
+        return sequence
+    if not isinstance(tokenizer, GuitarREMI):
+        raise TokenizationError("Guitar techniques require a GuitarREMI tokenizer.")
+
+    pitch_event_indexes: dict[tuple[int, int, int], list[int]] = defaultdict(list)
+    for index, event in enumerate(sequence.events):
+        if event.type_ == "Pitch":
+            pitch_event_indexes[
+                (int(event.time), int(event.value), int(event.desc))
+            ].append(index)
+
+    insertions: dict[int, list[Event]] = defaultdict(list)
+    for technique in techniques:
+        note = note_mapping[technique.note_index]
+        identity = (int(note.time), int(note.pitch), int(note.end))
+        matches = pitch_event_indexes.get(identity, [])
+        if len(matches) != 1:
+            raise TokenizationError(
+                f"Technique-bearing note {technique.note_index} in {source} matched "
+                f"{len(matches)} REMI Pitch events instead of one."
+            )
+        pitch_index = matches[0]
+        duration_index = pitch_index + (2 if tokenizer.config.use_velocities else 1)
+        if (
+            duration_index >= len(sequence.events)
+            or sequence.events[duration_index].type_ != "Duration"
+        ):
+            raise TokenizationError(
+                f"Technique-bearing note {technique.note_index} in {source} has no "
+                "postfix Duration event."
+            )
+        token = TECHNIQUE_TOKEN_BY_TYPE[technique.type]
+        token_value = token.split("_", maxsplit=1)[1]
+        pitch_event = sequence.events[pitch_index]
+        insertions[duration_index].append(
+            Event(
+                "Technique",
+                token_value,
+                int(pitch_event.time),
+                int(pitch_event.program),
+                int(pitch_event.desc),
+            )
+        )
+
+    events: list[Event] = []
+    for index, event in enumerate(sequence.events):
+        events.append(event)
+        events.extend(insertions.get(index, ()))
+    enriched = TokSequence(events=events)
+    try:
+        tokenizer.complete_sequence(enriched)
+    except Exception as exc:
+        raise TokenizationError(
+            f"Could not add guitar-technique tokens for {source}: {exc}"
+        ) from exc
+    return enriched
+
+
+def _encode_score_with_techniques(
+    tokenizer: REMI,
+    score: Score,
+    techniques: Sequence[TechniqueAnnotation],
+    *,
+    source: str,
+) -> TokSequence:
+    track, _ = _validated_single_track(score, source=source)
+    normalized = _normalize_techniques(
+        techniques, num_notes=len(track.notes), source=source
+    )
+    preprocessed = _preprocess_score(tokenizer, score, source=source)
+    preprocessed_track, _ = _validated_single_track(
+        preprocessed, source=f"preprocessed {source}"
+    )
+    mapping = _map_note_indices_after_preprocessing(
+        track, preprocessed_track, normalized, source=source
+    )
+    sequence = _encode_single_sequence(
+        tokenizer,
+        preprocessed,
+        source=source,
+        no_preprocess_score=True,
+    )
+    return _insert_technique_events(
+        tokenizer, sequence, normalized, mapping, source=source
+    )
+
+
+def _extract_postfix_techniques(
+    tokens: Sequence[str],
+    base_sequence: TokSequence,
+    track: Any,
+    *,
+    source: str,
+) -> tuple[TechniqueAnnotation, ...]:
+    canonical_notes = _canonical_notes(track)
+    note_index_by_identity: dict[tuple[int, int, int], int] = {}
+    for note_index, note in enumerate(canonical_notes):
+        identity = (int(note.time), int(note.pitch), int(note.end))
+        if identity in note_index_by_identity:
+            raise TokenizationError(
+                f"{source} contains ambiguous decoded note identities."
+            )
+        note_index_by_identity[identity] = note_index
+
+    annotations: list[TechniqueAnnotation] = []
+    base_index = -1
+    current_note_identity: tuple[int, int, int] | None = None
+    for token in tokens:
+        if token.startswith("Technique_"):
+            technique_type = TECHNIQUE_TYPE_BY_TOKEN.get(token)
+            if technique_type is None:
+                raise TokenizationError(f"Unknown guitar-technique token '{token}'.")
+            if current_note_identity is None:
+                raise TokenizationError(
+                    f"Technique token '{token}' is not postfix to a Duration."
+                )
+            note_index = note_index_by_identity.get(current_note_identity)
+            if note_index is None:
+                raise TokenizationError(
+                    f"Technique token '{token}' cannot be matched to a decoded note."
+                )
+            annotations.append(TechniqueAnnotation(technique_type, note_index))
+            continue
+
+        current_note_identity = None
+        base_index += 1
+        if base_index >= len(base_sequence.events):
+            raise TokenizationError("Technique filtering desynchronized REMI events.")
+        event = base_sequence.events[base_index]
+        if event.type_ != "Duration":
+            continue
+        pitch_index = base_index - 1
+        if (
+            pitch_index >= 0
+            and base_sequence.events[pitch_index].type_ == "Velocity"
+        ):
+            pitch_index -= 1
+        if pitch_index < 0 or base_sequence.events[pitch_index].type_ != "Pitch":
+            continue
+        pitch_event = base_sequence.events[pitch_index]
+        current_note_identity = (
+            int(pitch_event.time),
+            int(pitch_event.value),
+            int(pitch_event.desc),
+        )
+
+    if base_index + 1 != len(base_sequence.events):
+        raise TokenizationError("Technique filtering desynchronized REMI tokens.")
+    return _normalize_techniques(
+        annotations, num_notes=len(canonical_notes), source=source
+    )
+
+
+def _validated_stored_ids(
+    tokenizer: REMI, token_ids: Sequence[int]
+) -> tuple[int, ...]:
+    ids = _normalize_ids(token_ids, name="token IDs")
+    special_ids = get_special_token_ids(tokenizer)
+    if len(ids) < 3:
+        raise TokenizationError(
+            "A stored token sequence must contain BOS, musical content, and EOS."
+        )
+    if ids[0] != special_ids.bos or ids[-1] != special_ids.eos:
+        raise TokenizationError(
+            "A stored token sequence must begin with BOS and end with EOS."
+        )
+    if special_ids.pad in ids:
+        raise TokenizationError("PAD is only for batching and cannot be decoded.")
+    if special_ids.bos in ids[1:] or special_ids.eos in ids[:-1]:
+        raise TokenizationError("BOS and EOS may only occur at sequence boundaries.")
+    return _validated_musical_ids(tokenizer, ids[1:-1])
 
 
 def _validated_single_track(
@@ -335,10 +917,18 @@ def _validated_single_track(
 
 
 def _encode_single_sequence(
-    tokenizer: REMI, score: Score, *, source: str
+    tokenizer: REMI,
+    score: Score,
+    *,
+    source: str,
+    no_preprocess_score: bool = False,
 ) -> TokSequence:
     try:
-        encoded = tokenizer.encode(score, encode_ids=False)
+        encoded = tokenizer.encode(
+            score,
+            encode_ids=False,
+            no_preprocess_score=no_preprocess_score,
+        )
     except Exception as exc:
         raise TokenizationError(f"Could not encode {source}: {exc}") from exc
     if not isinstance(encoded, list) or len(encoded) != 1:
@@ -432,13 +1022,20 @@ def _token_error_ratio(tokenizer: REMI, sequence: TokSequence) -> float:
 
 
 __all__ = [
+    "DecodedMidi",
     "EncodedMidi",
+    "GuitarREMI",
     "SpecialTokenIds",
+    "TECHNIQUE_TOKEN_BY_TYPE",
+    "TECHNIQUE_TYPES",
+    "TechniqueAnnotation",
     "TokenizationError",
     "build_tokenizer",
+    "decode_symbolic_token_ids",
     "decode_token_ids",
     "encode_midi",
     "get_special_token_ids",
+    "get_technique_token_ids",
     "load_tokenizer",
     "save_tokenizer",
 ]
