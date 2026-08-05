@@ -66,6 +66,24 @@ def main(argv: list[str] | None = None) -> int:
         f"Best validation: {report.best_validation_loss:.4f} "
         f"at epoch {report.best_epoch}."
     )
+    validation_total = final.validation_metrics["total"]
+    post_duration = final.validation_metrics["post_duration_unknown"]
+    print(
+        "Validation diagnostics: "
+        f"full-vocabulary NLL {validation_total['full_vocab_nll']:.4f}, "
+        f"token top-1 {100 * validation_total['token_top1_accuracy']:.2f}%, "
+        f"token top-5 {100 * validation_total['token_top5_accuracy']:.2f}%, "
+        f"type top-1 {100 * validation_total['type_top1_accuracy']:.2f}%."
+    )
+    if post_duration["count"]:
+        print(
+            "Post-Duration unknown-technique decisions: "
+            f"{post_duration['count']:,} targets, "
+            f"objective NLL {post_duration['objective_nll']:.4f}, "
+            f"full-vocabulary NLL {post_duration['full_vocab_nll']:.4f}."
+        )
+    else:
+        print("Post-Duration unknown-technique decisions: no targets in validation.")
     print(f"Device: {report.device} | Parameters: {report.num_parameters:,}")
     print(f"Best checkpoint: {report.best_checkpoint}")
     print(f"Latest checkpoint: {report.latest_checkpoint}")

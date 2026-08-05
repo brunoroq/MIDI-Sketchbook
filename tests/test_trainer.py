@@ -41,6 +41,21 @@ class _SyntheticDataset:
     tokenizer_sha256 = "1" * 64
     configuration_sha256 = "2" * 64
     tokenization_manifest_sha256 = "3" * 64
+    technique_token_ids = frozenset({9, 10})
+    token_type_by_id = (
+        "PAD",
+        "BOS",
+        "EOS",
+        "Bar",
+        "Position",
+        "Pitch",
+        "Duration",
+        "Pitch",
+        "PitchBend",
+        "Technique",
+        "Technique",
+        "Rest",
+    )
 
     _IDS = {
         "train": (
@@ -66,7 +81,7 @@ class _SyntheticDataset:
         return {
             "input_ids": ids[:-1],
             "target_ids": ids[1:],
-            "loss_mask": (True,) * (len(ids) - 1),
+            "unknown_technique_decision_mask": (False,) * (len(ids) - 1),
             "length": len(ids) - 1,
             "sequence_id": f"{self.split}-{index}",
             "split": self.split,
@@ -206,6 +221,74 @@ def test_token_cross_entropy_ignores_pad_in_loss_count_and_gradient() -> None:
     assert torch.count_nonzero(logits.grad[0, 2]).item() > 0
 
 
+def test_partial_label_loss_trains_base_target_without_technique_gradients() -> None:
+    logits = torch.tensor(
+        [[[0.0, 0.5, 1.0, 4.0, 3.0, -0.5]]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    targets = torch.tensor([[2]], dtype=torch.long)
+    unknown = torch.tensor([[True]], dtype=torch.bool)
+
+    loss_sum, num_tokens = token_cross_entropy(
+        logits,
+        targets,
+        pad_token_id=0,
+        unknown_technique_decision_mask=unknown,
+        technique_token_ids=(3, 4),
+    )
+    expected = F.cross_entropy(
+        logits[0, 0, [0, 1, 2, 5]].unsqueeze(0),
+        torch.tensor([2]),
+        reduction="sum",
+    )
+    loss_sum.backward()
+
+    assert num_tokens.item() == 1
+    torch.testing.assert_close(loss_sum.detach(), expected.detach())
+    assert logits.grad is not None
+    torch.testing.assert_close(logits.grad[0, 0, 3:5], torch.zeros(2))
+    assert logits.grad[0, 0, 2].item() < 0
+    assert torch.count_nonzero(logits.grad[0, 0, [0, 1, 5]]).item() == 3
+
+
+def test_complete_post_duration_decision_uses_full_vocabulary_loss() -> None:
+    logits = torch.tensor(
+        [[[0.0, 0.5, 1.0, 4.0, 3.0, -0.5]]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    targets = torch.tensor([[2]], dtype=torch.long)
+
+    loss_sum, _ = token_cross_entropy(
+        logits,
+        targets,
+        pad_token_id=0,
+        unknown_technique_decision_mask=torch.tensor([[False]]),
+        technique_token_ids=(3, 4),
+    )
+    expected = F.cross_entropy(logits[0], targets[0], reduction="sum")
+    loss_sum.backward()
+
+    torch.testing.assert_close(loss_sum.detach(), expected.detach())
+    assert logits.grad is not None
+    assert logits.grad[0, 0, 3].item() > 0
+    assert logits.grad[0, 0, 4].item() > 0
+
+
+def test_partial_label_loss_rejects_technique_target_as_unknown() -> None:
+    logits = torch.zeros((1, 1, 6), dtype=torch.float32)
+
+    with pytest.raises(TrainingError, match="cannot be a Technique"):
+        token_cross_entropy(
+            logits,
+            torch.tensor([[3]], dtype=torch.long),
+            pad_token_id=0,
+            unknown_technique_decision_mask=torch.tensor([[True]]),
+            technique_token_ids=(3, 4),
+        )
+
+
 def test_token_cross_entropy_rejects_all_padding() -> None:
     logits = torch.zeros((2, 3, 5), dtype=torch.float32)
     targets = torch.zeros((2, 3), dtype=torch.long)
@@ -229,13 +312,16 @@ def test_train_epoch_backpropagates_and_counts_only_real_targets() -> None:
     batch = {
         "input_ids": torch.tensor([[1, 3, 4], [1, 4, 0]], dtype=torch.long),
         "target_ids": torch.tensor([[3, 4, 2], [4, 2, 0]], dtype=torch.long),
+        "unknown_technique_decision_mask": torch.zeros(
+            (2, 3), dtype=torch.bool
+        ),
     }
     before = {
         name: parameter.detach().clone()
         for name, parameter in model.named_parameters()
     }
 
-    loss, token_count, gradient_norm = trainer._train_epoch(
+    loss, token_count, gradient_norm, diagnostics = trainer._train_epoch(
         model,
         [batch],  # type: ignore[arg-type]
         optimizer,
@@ -244,11 +330,26 @@ def test_train_epoch_backpropagates_and_counts_only_real_targets() -> None:
         pad_token_id=0,
         gradient_clip=1.0,
         amp_enabled=False,
+        technique_token_ids=(7, 8),
+        token_type_by_id=(
+            "PAD",
+            "BOS",
+            "EOS",
+            "Bar",
+            "Position",
+            "Pitch",
+            "Duration",
+            "Technique",
+            "Technique",
+        ),
     )
 
     assert token_count == 5
     assert math.isfinite(loss) and loss > 0
     assert math.isfinite(gradient_norm) and gradient_norm > 0
+    assert diagnostics["total"]["count"] == 5
+    assert diagnostics["post_duration_unknown"]["count"] == 0
+    assert diagnostics["total"]["objective_nll"] == pytest.approx(loss)
     assert any(
         not torch.equal(before[name], parameter.detach())
         for name, parameter in model.named_parameters()
@@ -378,6 +479,12 @@ def test_resume_matches_uninterrupted_training_exactly(
     )
     assert resumed.history[-1].validation_loss == pytest.approx(
         uninterrupted.history[-1].validation_loss, rel=0, abs=0
+    )
+    assert resumed.history[-1].train_metrics == (
+        uninterrupted.history[-1].train_metrics
+    )
+    assert resumed.history[-1].validation_metrics == (
+        uninterrupted.history[-1].validation_metrics
     )
 
 

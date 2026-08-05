@@ -80,6 +80,8 @@ class _Corpus:
     bos_token_id: int
     eos_token_id: int
     duration_token_ids: frozenset[int]
+    technique_token_ids: frozenset[int]
+    token_type_by_id: tuple[str, ...]
     sequences: tuple[_Sequence, ...]
 
 
@@ -150,17 +152,15 @@ class TokenizedSequenceDataset:
         sequence = self._sequences[index]
         input_ids = sequence.ids[:-1]
         target_ids = sequence.ids[1:]
-        if sequence.technique_coverage == "COMPLETE":
-            loss_mask = (True,) * len(input_ids)
-        else:
-            loss_mask = tuple(
-                token_id not in self._corpus.duration_token_ids
-                for token_id in input_ids
-            )
+        unknown_technique_decision_mask = tuple(
+            sequence.technique_coverage == "UNLABELED"
+            and token_id in self._corpus.duration_token_ids
+            for token_id in input_ids
+        )
         return {
             "input_ids": input_ids,
             "target_ids": target_ids,
-            "loss_mask": loss_mask,
+            "unknown_technique_decision_mask": unknown_technique_decision_mask,
             "length": len(input_ids),
             "sequence_id": sequence.sequence_id,
             "split": sequence.split,
@@ -214,6 +214,18 @@ class TokenizedSequenceDataset:
     def eos_token_id(self) -> int:
         return self._corpus.eos_token_id
 
+    @property
+    def technique_token_ids(self) -> frozenset[int]:
+        """Immutable IDs excluded from base-only technique-unknown softmaxes."""
+
+        return self._corpus.technique_token_ids
+
+    @property
+    def token_type_by_id(self) -> tuple[str, ...]:
+        """Tokenizer event type for every contiguous vocabulary ID."""
+
+        return self._corpus.token_type_by_id
+
 
 @dataclass(frozen=True, slots=True)
 class TokenBatchCollator:
@@ -241,11 +253,10 @@ def collate_token_sequences(
 ) -> dict[str, object]:
     """Dynamically pad one batch and return next-token training tensors.
 
-    Both inputs and targets use PAD in padded positions.  Targets also use PAD
-    at real positions explicitly excluded by each sample's ``loss_mask``.  The
-    trainer must pass the same id as ``ignore_index`` to cross entropy.  The
-    boolean ``attention_mask`` and integer ``lengths`` continue to identify all
-    real positions, independently of whether they contribute to loss.
+    Both inputs and targets use PAD only in padded positions.  The boolean
+    ``unknown_technique_decision_mask`` marks real Duration-token positions
+    whose technique label is unknown; it does not erase their real next-token
+    target.  ``attention_mask`` and ``lengths`` identify all real positions.
     """
 
     pad_id = _require_nonnegative_int(pad_token_id, "pad_token_id")
@@ -264,7 +275,7 @@ def collate_token_sequences(
         required = {
             "input_ids",
             "target_ids",
-            "loss_mask",
+            "unknown_technique_decision_mask",
             "length",
             "sequence_id",
             "split",
@@ -276,24 +287,28 @@ def collate_token_sequences(
             )
         input_ids = _normalize_ids(sample["input_ids"], f"{name}.input_ids")
         target_ids = _normalize_ids(sample["target_ids"], f"{name}.target_ids")
-        loss_mask = _normalize_loss_mask(sample["loss_mask"], f"{name}.loss_mask")
+        unknown_mask = _normalize_boolean_mask(
+            sample["unknown_technique_decision_mask"],
+            f"{name}.unknown_technique_decision_mask",
+        )
         length = _require_positive_int(sample["length"], f"{name}.length")
         sequence_id = _require_string(sample["sequence_id"], f"{name}.sequence_id")
         split = _require_split(sample["split"], f"{name}.split")
         if (
             len(input_ids) != len(target_ids)
-            or len(input_ids) != len(loss_mask)
+            or len(input_ids) != len(unknown_mask)
             or len(input_ids) != length
         ):
             raise DatasetContractError(
-                f"{name} input, target, loss-mask, and declared lengths must match."
+                f"{name} input, target, unknown-decision-mask, and declared "
+                "lengths must match."
             )
         if pad_id in input_ids or pad_id in target_ids:
             raise DatasetContractError(
                 f"{name} contains PAD before batch collation."
             )
         normalized.append(
-            (input_ids, target_ids, loss_mask, length, sequence_id, split)
+            (input_ids, target_ids, unknown_mask, length, sequence_id, split)
         )
 
     try:
@@ -308,22 +323,23 @@ def collate_token_sequences(
     width = max(item[3] for item in normalized)
     inputs = torch.full((batch_size, width), pad_id, dtype=torch.long)
     targets = torch.full((batch_size, width), pad_id, dtype=torch.long)
-    loss_mask = torch.zeros((batch_size, width), dtype=torch.bool)
+    unknown_mask = torch.zeros((batch_size, width), dtype=torch.bool)
     lengths = torch.tensor([item[3] for item in normalized], dtype=torch.long)
-    for row, (input_ids, target_ids, sample_loss_mask, length, _, _) in enumerate(
+    for row, (input_ids, target_ids, sample_unknown_mask, length, _, _) in enumerate(
         normalized
     ):
         inputs[row, :length] = torch.tensor(input_ids, dtype=torch.long)
         targets[row, :length] = torch.tensor(target_ids, dtype=torch.long)
-        loss_mask[row, :length] = torch.tensor(sample_loss_mask, dtype=torch.bool)
-        targets[row, :length].masked_fill_(~loss_mask[row, :length], pad_id)
+        unknown_mask[row, :length] = torch.tensor(
+            sample_unknown_mask, dtype=torch.bool
+        )
     attention_mask = (
         torch.arange(width, dtype=torch.long).unsqueeze(0) < lengths.unsqueeze(1)
     )
     return {
         "input_ids": inputs,
         "target_ids": targets,
-        "loss_mask": loss_mask,
+        "unknown_technique_decision_mask": unknown_mask,
         "lengths": lengths,
         "attention_mask": attention_mask,
         "sequence_ids": [item[4] for item in normalized],
@@ -432,6 +448,10 @@ def _load_corpus(
         bos_token_id=tokenizer_info["bos"],
         eos_token_id=tokenizer_info["eos"],
         duration_token_ids=tokenizer_info["duration_token_ids"],
+        technique_token_ids=frozenset(
+            tokenizer_info["technique_token_ids"].values()
+        ),
+        token_type_by_id=tokenizer_info["token_type_by_id"],
         sequences=sequences,
     )
 
@@ -630,6 +650,14 @@ def _validate_tokenizer(
     vocabulary_ids = frozenset(vocabulary_by_id)
     if len(vocabulary_ids) != vocabulary_size:
         raise DatasetContractError("Tokenizer vocabulary IDs must be unique.")
+    if vocabulary_ids != frozenset(range(vocabulary_size)):
+        raise DatasetContractError(
+            "Tokenizer vocabulary IDs must be contiguous from zero."
+        )
+    token_type_by_id = tuple(
+        vocabulary_by_id[token_id].split("_", 1)[0]
+        for token_id in range(vocabulary_size)
+    )
     pitch_bend_ids = frozenset(
         token_id
         for token_id, token in vocabulary_by_id.items()
@@ -660,6 +688,7 @@ def _validate_tokenizer(
         "technique_token_ids": technique_token_ids,
         "pitch_bend_ids": pitch_bend_ids,
         "duration_token_ids": duration_token_ids,
+        "token_type_by_id": token_type_by_id,
     }
 
 
@@ -1387,7 +1416,7 @@ def _normalize_ids(value: object, name: str) -> tuple[int, ...]:
     )
 
 
-def _normalize_loss_mask(value: object, name: str) -> tuple[bool, ...]:
+def _normalize_boolean_mask(value: object, name: str) -> tuple[bool, ...]:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise DatasetContractError(f"{name} must be a sequence of booleans.")
     normalized: list[bool] = []

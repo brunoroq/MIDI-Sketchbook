@@ -26,11 +26,16 @@ from torch.utils.tensorboard import SummaryWriter
 from .dataset import TokenizedSequenceDataset, make_collate_fn
 from .model import GRUModel
 from .training_config import TrainingConfig
+from .training_metrics import (
+    METRICS_SCHEMA_VERSION,
+    TrainingMetricsAccumulator,
+    TrainingMetricsError,
+)
 from .utils import relative_label, write_json
 
 
 LOGGER = logging.getLogger(__name__)
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
 
 
 class TrainingError(RuntimeError):
@@ -50,6 +55,8 @@ class EpochMetrics:
     validation_tokens: int
     mean_gradient_norm: float
     duration_seconds: float
+    train_metrics: dict[str, Any]
+    validation_metrics: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,7 +288,12 @@ def run_training(
         )
         for epoch in range(start_epoch, epochs + 1):
             started = time.monotonic()
-            train_loss, train_tokens, mean_gradient_norm = _train_epoch(
+            (
+                train_loss,
+                train_tokens,
+                mean_gradient_norm,
+                train_diagnostics,
+            ) = _train_epoch(
                 model,
                 train_loader,
                 optimizer,
@@ -290,13 +302,21 @@ def run_training(
                 train_dataset.pad_token_id,
                 config.training.gradient_clip,
                 amp_enabled,
+                train_dataset.technique_token_ids,
+                train_dataset.token_type_by_id,
             )
-            validation_loss, validation_tokens = _evaluate_epoch(
+            (
+                validation_loss,
+                validation_tokens,
+                validation_diagnostics,
+            ) = _evaluate_epoch(
                 model,
                 validation_loader,
                 device,
                 train_dataset.pad_token_id,
                 amp_enabled,
+                train_dataset.technique_token_ids,
+                train_dataset.token_type_by_id,
             )
             metrics = EpochMetrics(
                 epoch=epoch,
@@ -308,6 +328,8 @@ def run_training(
                 validation_tokens=validation_tokens,
                 mean_gradient_norm=mean_gradient_norm,
                 duration_seconds=time.monotonic() - started,
+                train_metrics=train_diagnostics,
+                validation_metrics=validation_diagnostics,
             )
             history.append(metrics)
             _write_tensorboard_metrics(writer, metrics, optimizer)
@@ -349,12 +371,17 @@ def run_training(
 
             LOGGER.info(
                 "Epoch %d/%d | train %.4f | validation %.4f | "
-                "perplexity %.2f | grad %.3f | %.1fs",
+                "perplexity %.2f | token top-1 %.1f%% | type top-1 %.1f%% | "
+                "grad %.3f | %.1fs",
                 epoch,
                 epochs,
                 train_loss,
                 validation_loss,
                 metrics.validation_perplexity,
+                100.0
+                * float(validation_diagnostics["total"]["token_top1_accuracy"]),
+                100.0
+                * float(validation_diagnostics["total"]["type_top1_accuracy"]),
                 mean_gradient_norm,
                 metrics.duration_seconds,
             )
@@ -431,20 +458,30 @@ def _train_epoch(
     pad_token_id: int,
     gradient_clip: float,
     amp_enabled: bool,
-) -> tuple[float, int, float]:
+    technique_token_ids: Sequence[int] | frozenset[int],
+    token_type_by_id: Sequence[str],
+) -> tuple[float, int, float, dict[str, Any]]:
     model.train()
     total_loss = 0.0
     total_tokens = 0
     gradient_norms: list[float] = []
+    diagnostics = _metrics_accumulator(
+        pad_token_id, technique_token_ids, token_type_by_id
+    )
     for batch in loader:
-        input_ids, target_ids = _batch_tensors(batch, device)
+        input_ids, target_ids, unknown_mask = _batch_tensors(batch, device)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device.type, dtype=torch.float16, enabled=amp_enabled):
             logits = model(input_ids)
             loss_sum, num_tokens = token_cross_entropy(
-                logits, target_ids, pad_token_id
+                logits,
+                target_ids,
+                pad_token_id,
+                unknown_technique_decision_mask=unknown_mask,
+                technique_token_ids=technique_token_ids,
             )
             loss = loss_sum / num_tokens
+        _update_metrics(diagnostics, logits, target_ids, unknown_mask)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         try:
@@ -461,10 +498,14 @@ def _train_epoch(
         gradient_norms.append(float(gradient_norm.detach().item()))
     if total_tokens == 0 or not gradient_norms:
         raise TrainingError("Training DataLoader produced no target tokens.")
+    report = diagnostics.snapshot().to_dict()
+    if report["total"]["count"] != total_tokens:
+        raise TrainingError("Training diagnostics lost target tokens.")
     return (
         total_loss / total_tokens,
         total_tokens,
         sum(gradient_norms) / len(gradient_norms),
+        report,
     )
 
 
@@ -475,29 +516,82 @@ def _evaluate_epoch(
     device: torch.device,
     pad_token_id: int,
     amp_enabled: bool,
-) -> tuple[float, int]:
+    technique_token_ids: Sequence[int] | frozenset[int],
+    token_type_by_id: Sequence[str],
+) -> tuple[float, int, dict[str, Any]]:
     model.eval()
     total_loss = 0.0
     total_tokens = 0
+    diagnostics = _metrics_accumulator(
+        pad_token_id, technique_token_ids, token_type_by_id
+    )
     for batch in loader:
-        input_ids, target_ids = _batch_tensors(batch, device)
+        input_ids, target_ids, unknown_mask = _batch_tensors(batch, device)
         with torch.autocast(device.type, dtype=torch.float16, enabled=amp_enabled):
             logits = model(input_ids)
             loss_sum, num_tokens = token_cross_entropy(
-                logits, target_ids, pad_token_id
+                logits,
+                target_ids,
+                pad_token_id,
+                unknown_technique_decision_mask=unknown_mask,
+                technique_token_ids=technique_token_ids,
             )
+        _update_metrics(diagnostics, logits, target_ids, unknown_mask)
         count = int(num_tokens.item())
         total_loss += float(loss_sum.item())
         total_tokens += count
     if total_tokens == 0:
         raise TrainingError("Validation DataLoader produced no target tokens.")
-    return total_loss / total_tokens, total_tokens
+    report = diagnostics.snapshot().to_dict()
+    if report["total"]["count"] != total_tokens:
+        raise TrainingError("Validation diagnostics lost target tokens.")
+    return total_loss / total_tokens, total_tokens, report
+
+
+def _metrics_accumulator(
+    pad_token_id: int,
+    technique_token_ids: Sequence[int] | frozenset[int],
+    token_type_by_id: Sequence[str],
+) -> TrainingMetricsAccumulator:
+    try:
+        return TrainingMetricsAccumulator(
+            pad_token_id,
+            technique_token_ids,
+            token_type_by_id,
+        )
+    except TrainingMetricsError as exc:
+        raise TrainingError(f"Invalid training metrics contract: {exc}") from exc
+
+
+def _update_metrics(
+    accumulator: TrainingMetricsAccumulator,
+    logits: Tensor,
+    targets: Tensor,
+    unknown_mask: Tensor,
+) -> None:
+    try:
+        accumulator.update(logits, targets, unknown_mask)
+    except TrainingMetricsError as exc:
+        raise TrainingError(f"Could not compute training metrics: {exc}") from exc
 
 
 def token_cross_entropy(
-    logits: Tensor, targets: Tensor, pad_token_id: int
+    logits: Tensor,
+    targets: Tensor,
+    pad_token_id: int,
+    *,
+    unknown_technique_decision_mask: Tensor | None = None,
+    technique_token_ids: Sequence[int] | frozenset[int] = (),
 ) -> tuple[Tensor, Tensor]:
-    """Return summed next-token cross entropy and the real-token count."""
+    """Return the partial-label objective and the real-token count.
+
+    At an ``UNLABELED`` note's post-``Duration`` decision, the base target is
+    known but the presence of a guitar technique is not.  Those positions use
+    a softmax over the non-technique vocabulary: the real structural target
+    still trains normally, while the six ``Technique`` logits receive exactly
+    zero gradient.  Fully labelled and ordinary positions use the complete
+    vocabulary.
+    """
 
     if logits.ndim != 3 or targets.ndim != 2:
         raise TrainingError("Logits and targets must have shapes (B,T,V) and (B,T).")
@@ -505,15 +599,99 @@ def token_cross_entropy(
         raise TrainingError("Logit and target batch/time dimensions must match.")
     if targets.dtype != torch.long:
         raise TrainingError("Targets must use torch.long token identifiers.")
-    num_tokens = (targets != pad_token_id).sum()
+    if targets.device != logits.device:
+        raise TrainingError("Logits and targets must share a device.")
+    vocabulary_size = logits.shape[-1]
+    if (
+        isinstance(pad_token_id, bool)
+        or not isinstance(pad_token_id, int)
+        or not 0 <= pad_token_id < vocabulary_size
+    ):
+        raise TrainingError("pad_token_id must be inside the model vocabulary.")
+    real_mask = targets != pad_token_id
+    if unknown_technique_decision_mask is None:
+        unknown_mask = torch.zeros_like(targets, dtype=torch.bool)
+    else:
+        if (
+            not isinstance(unknown_technique_decision_mask, Tensor)
+            or unknown_technique_decision_mask.dtype != torch.bool
+            or unknown_technique_decision_mask.shape != targets.shape
+            or unknown_technique_decision_mask.device != targets.device
+        ):
+            raise TrainingError(
+                "unknown_technique_decision_mask must be a boolean tensor "
+                "matching targets."
+            )
+        unknown_mask = unknown_technique_decision_mask
+    if torch.any(unknown_mask & ~real_mask):
+        raise TrainingError(
+            "Unknown technique decisions cannot mark padded target positions."
+        )
+
+    normalized_technique_ids: list[int] = []
+    for index, token_id in enumerate(technique_token_ids):
+        if (
+            isinstance(token_id, bool)
+            or not isinstance(token_id, int)
+            or not 0 <= token_id < vocabulary_size
+        ):
+            raise TrainingError(
+                f"technique_token_ids[{index}] must be inside the vocabulary."
+            )
+        normalized_technique_ids.append(token_id)
+    if len(set(normalized_technique_ids)) != len(normalized_technique_ids):
+        raise TrainingError("technique_token_ids must be distinct.")
+    normalized_technique_ids.sort()
+    if pad_token_id in normalized_technique_ids:
+        raise TrainingError("PAD cannot be a technique token ID.")
+    if torch.any(unknown_mask) and not normalized_technique_ids:
+        raise TrainingError(
+            "Unknown technique decisions require technique_token_ids."
+        )
+
+    num_tokens = real_mask.sum()
     if int(num_tokens.item()) <= 0:
         raise TrainingError("A training batch cannot contain only padding targets.")
-    loss_sum = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]),
-        targets.reshape(-1),
-        ignore_index=pad_token_id,
-        reduction="sum",
-    )
+    loss_sum = logits.sum() * 0.0
+    ordinary_mask = real_mask & ~unknown_mask
+    if torch.any(ordinary_mask):
+        loss_sum = loss_sum + F.cross_entropy(
+            logits[ordinary_mask],
+            targets[ordinary_mask],
+            reduction="sum",
+        )
+    if torch.any(unknown_mask):
+        technique_tensor = torch.tensor(
+            normalized_technique_ids,
+            dtype=torch.long,
+            device=targets.device,
+        )
+        if torch.any(
+            (targets[unknown_mask].unsqueeze(1) == technique_tensor).any(dim=1)
+        ):
+            raise TrainingError(
+                "An UNLABELED post-Duration target cannot be a Technique token."
+            )
+        allowed = torch.ones(
+            vocabulary_size, dtype=torch.bool, device=targets.device
+        )
+        allowed[technique_tensor] = False
+        remap = torch.full(
+            (vocabulary_size,), -1, dtype=torch.long, device=targets.device
+        )
+        remap[allowed] = torch.arange(
+            int(allowed.sum().item()), dtype=torch.long, device=targets.device
+        )
+        restricted_targets = remap[targets[unknown_mask]]
+        if torch.any(restricted_targets < 0):
+            raise TrainingError(
+                "Restricted post-Duration target is outside the base vocabulary."
+            )
+        loss_sum = loss_sum + F.cross_entropy(
+            logits[unknown_mask][:, allowed],
+            restricted_targets,
+            reduction="sum",
+        )
     if not torch.isfinite(loss_sum):
         raise TrainingError("Cross-entropy loss became non-finite.")
     return loss_sum, num_tokens
@@ -521,14 +699,27 @@ def token_cross_entropy(
 
 def _batch_tensors(
     batch: Mapping[str, Any], device: torch.device
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor]:
     input_ids = batch.get("input_ids")
     target_ids = batch.get("target_ids")
-    if not isinstance(input_ids, Tensor) or not isinstance(target_ids, Tensor):
-        raise TrainingError("Dataset batches must contain input_ids and target_ids tensors.")
+    unknown_mask = batch.get("unknown_technique_decision_mask")
+    if (
+        not isinstance(input_ids, Tensor)
+        or not isinstance(target_ids, Tensor)
+        or not isinstance(unknown_mask, Tensor)
+    ):
+        raise TrainingError(
+            "Dataset batches must contain input_ids, target_ids, and "
+            "unknown_technique_decision_mask tensors."
+        )
+    if unknown_mask.dtype != torch.bool or unknown_mask.shape != target_ids.shape:
+        raise TrainingError(
+            "unknown_technique_decision_mask must be boolean and match target_ids."
+        )
     return (
         input_ids.to(device, non_blocking=device.type == "cuda"),
         target_ids.to(device, non_blocking=device.type == "cuda"),
+        unknown_mask.to(device, non_blocking=device.type == "cuda"),
     )
 
 
@@ -556,6 +747,8 @@ def _validate_dataset_pair(
         "tokenizer_sha256",
         "configuration_sha256",
         "tokenization_manifest_sha256",
+        "technique_token_ids",
+        "token_type_by_id",
     )
     for attribute in attributes:
         if getattr(train, attribute) != getattr(validation, attribute):
@@ -739,6 +932,18 @@ def _history_from_checkpoint(
                 raise ValueError
             if metrics.train_tokens <= 0 or metrics.validation_tokens <= 0:
                 raise ValueError
+            _validate_metrics_report(
+                metrics.train_metrics,
+                "train_metrics",
+                expected_count=metrics.train_tokens,
+                expected_objective_nll=metrics.train_loss,
+            )
+            _validate_metrics_report(
+                metrics.validation_metrics,
+                "validation_metrics",
+                expected_count=metrics.validation_tokens,
+                expected_objective_nll=metrics.validation_loss,
+            )
             history.append(metrics)
     except (TypeError, ValueError) as exc:
         raise TrainingError("Checkpoint contains invalid epoch history.") from exc
@@ -747,6 +952,104 @@ def _history_from_checkpoint(
             "Checkpoint history must contain every epoch through its completed epoch."
         )
     return history
+
+
+def _validate_metrics_report(
+    value: object,
+    name: str,
+    *,
+    expected_count: int,
+    expected_objective_nll: float,
+) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    expected_keys = {
+        "schema_version",
+        "batches",
+        "total",
+        "post_duration_unknown",
+        "by_target_type",
+    }
+    if set(value) != expected_keys:
+        raise ValueError(f"{name} has invalid keys")
+    schema_version = value["schema_version"]
+    batches = value["batches"]
+    if (
+        isinstance(schema_version, bool)
+        or schema_version != METRICS_SCHEMA_VERSION
+        or isinstance(batches, bool)
+        or not isinstance(batches, int)
+        or batches <= 0
+    ):
+        raise ValueError(f"{name} has invalid schema or batch count")
+    total_count, total_objective = _validate_metric_aggregate(
+        value["total"], f"{name}.total"
+    )
+    post_count, _ = _validate_metric_aggregate(
+        value["post_duration_unknown"], f"{name}.post_duration_unknown"
+    )
+    by_target_type = value["by_target_type"]
+    if not isinstance(by_target_type, Mapping) or not by_target_type:
+        raise ValueError(f"{name}.by_target_type must be a non-empty mapping")
+    type_count = 0
+    for token_type, aggregate in by_target_type.items():
+        if not isinstance(token_type, str) or not token_type:
+            raise ValueError(f"{name}.by_target_type has an invalid token type")
+        aggregate_count, _ = _validate_metric_aggregate(
+            aggregate, f"{name}.by_target_type.{token_type}"
+        )
+        type_count += aggregate_count
+    if total_count != expected_count or type_count != total_count:
+        raise ValueError(f"{name} token counts are inconsistent")
+    if post_count > total_count:
+        raise ValueError(f"{name} post-Duration count exceeds its total")
+    if total_objective is None or not math.isclose(
+        total_objective,
+        expected_objective_nll,
+        rel_tol=1e-4,
+        abs_tol=1e-6,
+    ):
+        raise ValueError(f"{name} objective NLL disagrees with epoch loss")
+
+
+def _validate_metric_aggregate(
+    value: object, name: str
+) -> tuple[int, float | None]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    metric_keys = {
+        "full_vocab_nll",
+        "full_vocab_perplexity",
+        "objective_nll",
+        "objective_perplexity",
+        "token_top1_accuracy",
+        "token_top5_accuracy",
+        "type_top1_accuracy",
+    }
+    if set(value) != {"count", *metric_keys}:
+        raise ValueError(f"{name} has invalid keys")
+    count = value["count"]
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ValueError(f"{name}.count must be a non-negative integer")
+    if count == 0:
+        if any(value[key] is not None for key in metric_keys):
+            raise ValueError(f"{name} must use null metrics when count is zero")
+        return count, None
+    for key in metric_keys:
+        number = value[key]
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, (int, float))
+            or not math.isfinite(float(number))
+        ):
+            raise ValueError(f"{name}.{key} must be finite")
+        converted = float(number)
+        if key.endswith("accuracy"):
+            if not 0.0 <= converted <= 1.0:
+                raise ValueError(f"{name}.{key} must be between zero and one")
+        elif converted < 0.0:
+            raise ValueError(f"{name}.{key} must be non-negative")
+    return count, float(value["objective_nll"])
 
 
 def _validate_resume_progress(
@@ -879,7 +1182,13 @@ def _canonical_hash(value: Any) -> str:
 def _training_implementation_sha256() -> str:
     package_dir = Path(__file__).resolve().parent
     digest = hashlib.sha256()
-    for filename in ("dataset.py", "model.py", "trainer.py", "training_config.py"):
+    for filename in (
+        "dataset.py",
+        "model.py",
+        "trainer.py",
+        "training_config.py",
+        "training_metrics.py",
+    ):
         path = package_dir / filename
         digest.update(filename.encode("utf-8"))
         digest.update(path.read_bytes())
@@ -920,6 +1229,37 @@ def _write_tensorboard_metrics(
     )
     writer.add_scalar("optimization/gradient_norm", metrics.mean_gradient_norm, metrics.epoch)
     writer.add_scalar("optimization/learning_rate", optimizer.param_groups[0]["lr"], metrics.epoch)
+    _write_tensorboard_report(
+        writer, "train", metrics.train_metrics, metrics.epoch
+    )
+    _write_tensorboard_report(
+        writer, "validation", metrics.validation_metrics, metrics.epoch
+    )
+
+
+def _write_tensorboard_report(
+    writer: SummaryWriter,
+    phase: str,
+    report: Mapping[str, Any],
+    epoch: int,
+) -> None:
+    scopes: list[tuple[str, Mapping[str, Any]]] = [
+        ("total", report["total"]),
+        ("post_duration_unknown", report["post_duration_unknown"]),
+    ]
+    by_target_type = report["by_target_type"]
+    scopes.extend(
+        (f"by_target_type/{token_type}", aggregate)
+        for token_type, aggregate in sorted(by_target_type.items())
+    )
+    for scope, aggregate in scopes:
+        for metric_name, metric_value in aggregate.items():
+            if metric_value is not None:
+                writer.add_scalar(
+                    f"metrics/{phase}/{scope}/{metric_name}",
+                    metric_value,
+                    epoch,
+                )
 
 
 __all__ = [

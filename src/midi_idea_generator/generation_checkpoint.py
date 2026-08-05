@@ -20,6 +20,7 @@ from torch import Tensor
 
 from .dataset import DatasetContractError, TokenizedSequenceDataset
 from .model import GRUModel, ModelConfigurationError
+from .training_metrics import METRICS_SCHEMA_VERSION
 from .tokenizer import (
     TokenizationError,
     get_special_token_ids,
@@ -27,7 +28,8 @@ from .tokenizer import (
 )
 
 
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
+SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS = frozenset({1, CHECKPOINT_SCHEMA_VERSION})
 _MAX_CHECKPOINT_SIZE_BYTES = 512 * 1024 * 1024
 _MAX_MANIFEST_SIZE_BYTES = 64 * 1024 * 1024
 _MAX_TOKENIZER_SIZE_BYTES = 16 * 1024 * 1024
@@ -77,7 +79,7 @@ _MODEL_KEYS = {
     "num_layers",
     "dropout",
 }
-_HISTORY_KEYS = {
+_HISTORY_KEYS_V1 = {
     "epoch",
     "train_loss",
     "validation_loss",
@@ -88,6 +90,7 @@ _HISTORY_KEYS = {
     "mean_gradient_norm",
     "duration_seconds",
 }
+_HISTORY_KEYS_V2 = _HISTORY_KEYS_V1 | {"train_metrics", "validation_metrics"}
 
 
 class GenerationCheckpointError(RuntimeError):
@@ -371,11 +374,11 @@ def _validate_checkpoint_payload(
     payload: Mapping[str, Any], checkpoint_path: Path
 ) -> dict[str, Any]:
     _exact_keys(payload, _CHECKPOINT_KEYS, "checkpoint")
-    if _integer(payload["schema_version"], "schema_version", minimum=1) != (
-        CHECKPOINT_SCHEMA_VERSION
-    ):
+    schema_version = _integer(payload["schema_version"], "schema_version", minimum=1)
+    if schema_version not in SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS:
         raise GenerationCheckpointError(
-            f"Checkpoint schema must be {CHECKPOINT_SCHEMA_VERSION}."
+            "Checkpoint schema must be one of "
+            f"{sorted(SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS)}."
         )
     training_run_id = _string(payload["training_run_id"], "training_run_id")
     if not _RUN_ID_PATTERN.fullmatch(training_run_id) or training_run_id in {".", ".."}:
@@ -469,9 +472,12 @@ def _validate_checkpoint_payload(
             "Checkpoint history must contain every completed epoch."
         )
     validation_losses: list[float] = []
+    history_keys = (
+        _HISTORY_KEYS_V2 if schema_version == 2 else _HISTORY_KEYS_V1
+    )
     for index, value in enumerate(history, start=1):
         entry = _mapping(value, f"history[{index - 1}]")
-        _exact_keys(entry, _HISTORY_KEYS, f"history[{index - 1}]")
+        _exact_keys(entry, history_keys, f"history[{index - 1}]")
         if _integer(entry["epoch"], f"history[{index - 1}].epoch", minimum=1) != index:
             raise GenerationCheckpointError("Checkpoint history epochs are not contiguous.")
         for key in (
@@ -483,8 +489,29 @@ def _validate_checkpoint_payload(
             "duration_seconds",
         ):
             _number(entry[key], f"history[{index - 1}].{key}", minimum=0.0)
-        for key in ("train_tokens", "validation_tokens"):
-            _integer(entry[key], f"history[{index - 1}].{key}", minimum=1)
+        train_tokens = _integer(
+            entry["train_tokens"],
+            f"history[{index - 1}].train_tokens",
+            minimum=1,
+        )
+        validation_tokens = _integer(
+            entry["validation_tokens"],
+            f"history[{index - 1}].validation_tokens",
+            minimum=1,
+        )
+        if schema_version == 2:
+            _validate_metrics_report(
+                entry["train_metrics"],
+                f"history[{index - 1}].train_metrics",
+                expected_count=train_tokens,
+                expected_objective_nll=float(entry["train_loss"]),
+            )
+            _validate_metrics_report(
+                entry["validation_metrics"],
+                f"history[{index - 1}].validation_metrics",
+                expected_count=validation_tokens,
+                expected_objective_nll=float(entry["validation_loss"]),
+            )
         validation_losses.append(float(entry["validation_loss"]))
     if validation_losses[best_epoch - 1] != best_validation_loss:
         raise GenerationCheckpointError(
@@ -636,6 +663,103 @@ def _resolve_device(value: str) -> torch.device:
             )
         return torch.device("cuda")
     raise GenerationCheckpointError("device must be 'auto', 'cpu', or 'cuda'.")
+
+
+def _validate_metrics_report(
+    value: object,
+    name: str,
+    *,
+    expected_count: int,
+    expected_objective_nll: float,
+) -> None:
+    report = _mapping(value, name)
+    _exact_keys(
+        report,
+        {
+            "schema_version",
+            "batches",
+            "total",
+            "post_duration_unknown",
+            "by_target_type",
+        },
+        name,
+    )
+    if (
+        _integer(report["schema_version"], f"{name}.schema_version", minimum=1)
+        != METRICS_SCHEMA_VERSION
+    ):
+        raise GenerationCheckpointError(
+            f"{name}.schema_version must be {METRICS_SCHEMA_VERSION}."
+        )
+    _integer(report["batches"], f"{name}.batches", minimum=1)
+    total_count, total_objective = _validate_metric_aggregate(
+        report["total"], f"{name}.total"
+    )
+    post_count, _ = _validate_metric_aggregate(
+        report["post_duration_unknown"], f"{name}.post_duration_unknown"
+    )
+    by_target_type = _mapping(report["by_target_type"], f"{name}.by_target_type")
+    if not by_target_type:
+        raise GenerationCheckpointError(
+            f"{name}.by_target_type must not be empty."
+        )
+    type_count = 0
+    for token_type, aggregate in by_target_type.items():
+        if not token_type:
+            raise GenerationCheckpointError(
+                f"{name}.by_target_type has an empty token type."
+            )
+        count, _ = _validate_metric_aggregate(
+            aggregate, f"{name}.by_target_type.{token_type}"
+        )
+        type_count += count
+    if total_count != expected_count or type_count != total_count:
+        raise GenerationCheckpointError(f"{name} token counts are inconsistent.")
+    if post_count > total_count:
+        raise GenerationCheckpointError(
+            f"{name}.post_duration_unknown exceeds the total count."
+        )
+    if total_objective is None or not math.isclose(
+        total_objective,
+        expected_objective_nll,
+        rel_tol=1e-4,
+        abs_tol=1e-6,
+    ):
+        raise GenerationCheckpointError(
+            f"{name}.total.objective_nll disagrees with the epoch loss."
+        )
+
+
+def _validate_metric_aggregate(
+    value: object, name: str
+) -> tuple[int, float | None]:
+    aggregate = _mapping(value, name)
+    metric_keys = {
+        "full_vocab_nll",
+        "full_vocab_perplexity",
+        "objective_nll",
+        "objective_perplexity",
+        "token_top1_accuracy",
+        "token_top5_accuracy",
+        "type_top1_accuracy",
+    }
+    _exact_keys(aggregate, {"count", *metric_keys}, name)
+    count = _integer(aggregate["count"], f"{name}.count", minimum=0)
+    if count == 0:
+        if any(aggregate[key] is not None for key in metric_keys):
+            raise GenerationCheckpointError(
+                f"{name} metrics must be null when count is zero."
+            )
+        return count, None
+    for key in metric_keys:
+        maximum = 1.0 if key.endswith("accuracy") else None
+        _number(
+            aggregate[key],
+            f"{name}.{key}",
+            minimum=0.0,
+            maximum=maximum,
+        )
+    return count, float(aggregate["objective_nll"])
 
 
 def _mapping(value: object, name: str) -> Mapping[str, Any]:

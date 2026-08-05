@@ -388,7 +388,15 @@ def test_dataset_uses_manifest_only_and_builds_next_token_pairs(tmp_path: Path) 
     assert first["target_ids"] == tuple(payload["ids"][1:])
     assert corpus.special_ids[0] not in first["input_ids"]
     assert corpus.special_ids[0] not in first["target_ids"]
-    assert len(first["loss_mask"]) == first["length"]
+    assert len(first["unknown_technique_decision_mask"]) == first["length"]
+    assert isinstance(dataset.technique_token_ids, frozenset)
+    assert dataset.technique_token_ids == frozenset(corpus.technique_ids.values())
+    assert len(dataset.token_type_by_id) == dataset.vocabulary_size
+    assert dataset.token_type_by_id[dataset.pad_token_id] == "PAD"
+    assert {
+        dataset.token_type_by_id[token_id]
+        for token_id in dataset.technique_token_ids
+    } == {"Technique"}
     assert first["length"] == len(payload["ids"]) - 1
     assert first["split"] == "train"
     assert first["input_ids"][0] == dataset.bos_token_id
@@ -446,22 +454,29 @@ def test_dynamic_collate_pads_inputs_targets_and_mask(tmp_path: Path) -> None:
 
     assert batch["input_ids"].shape == (2, 7)
     assert batch["target_ids"].shape == (2, 7)
-    assert batch["loss_mask"].shape == (2, 7)
+    assert batch["unknown_technique_decision_mask"].shape == (2, 7)
     assert batch["lengths"].tolist() == [4, 7]
     assert batch["attention_mask"].dtype == torch.bool
-    assert batch["loss_mask"].dtype == torch.bool
+    assert batch["unknown_technique_decision_mask"].dtype == torch.bool
     assert batch["attention_mask"].tolist() == [
         [True, True, True, True, False, False, False],
         [True, True, True, True, True, True, True],
     ]
     assert batch["input_ids"][0, 4:].tolist() == [dataset.pad_token_id] * 3
     assert batch["target_ids"][0, 4:].tolist() == [dataset.pad_token_id] * 3
-    assert batch["loss_mask"][0, 4:].tolist() == [False, False, False]
-    assert batch["loss_mask"][0, :4].tolist() == list(dataset[0]["loss_mask"])
-    assert batch["loss_mask"][1, :7].tolist() == list(dataset[1]["loss_mask"])
-    assert torch.all(batch["target_ids"][~batch["loss_mask"]] == dataset.pad_token_id)
+    assert batch["unknown_technique_decision_mask"][0, 4:].tolist() == [
+        False,
+        False,
+        False,
+    ]
+    assert batch["unknown_technique_decision_mask"][0, :4].tolist() == list(
+        dataset[0]["unknown_technique_decision_mask"]
+    )
+    assert batch["unknown_technique_decision_mask"][1, :7].tolist() == list(
+        dataset[1]["unknown_technique_decision_mask"]
+    )
     assert int((batch["target_ids"] != dataset.pad_token_id).sum().item()) == sum(
-        sum(sample["loss_mask"]) for sample in (dataset[0], dataset[1])
+        sample["length"] for sample in (dataset[0], dataset[1])
     )
     assert batch["sequence_ids"] == [
         dataset[0]["sequence_id"],
@@ -472,13 +487,16 @@ def test_dynamic_collate_pads_inputs_targets_and_mask(tmp_path: Path) -> None:
     collator = make_collate_fn(dataset.pad_token_id)
     repeated = collator([dataset[0], dataset[1]])
     assert torch.equal(repeated["input_ids"], batch["input_ids"])
-    assert torch.equal(repeated["loss_mask"], batch["loss_mask"])
+    assert torch.equal(
+        repeated["unknown_technique_decision_mask"],
+        batch["unknown_technique_decision_mask"],
+    )
 
 
-def test_unlabeled_masks_only_duration_decisions_but_complete_empty_does_not(
+def test_unlabeled_marks_duration_decisions_without_erasing_real_targets(
     tmp_path: Path,
 ) -> None:
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     corpus = _make_synthetic_corpus(
         tmp_path,
         split_lengths={"train": (5, 5)},
@@ -507,23 +525,25 @@ def test_unlabeled_masks_only_duration_decisions_but_complete_empty_does_not(
     assert unlabeled["input_ids"] == tuple(ids[:-1])
     assert unlabeled["target_ids"] == tuple(ids[1:])
     assert pad not in unlabeled["target_ids"]
-    assert unlabeled["loss_mask"] == (True, True, False, True)
-    assert complete["loss_mask"] == (True, True, True, True)
+    assert unlabeled["unknown_technique_decision_mask"] == (
+        False,
+        False,
+        True,
+        False,
+    )
+    assert complete["unknown_technique_decision_mask"] == (False,) * 4
 
     batch = collate_token_sequences([unlabeled, complete], pad)
 
     assert batch["attention_mask"].tolist() == [[True] * 4, [True] * 4]
-    assert batch["loss_mask"].tolist() == [
-        [True, True, False, True],
-        [True, True, True, True],
+    assert batch["unknown_technique_decision_mask"].tolist() == [
+        [False, False, True, False],
+        [False, False, False, False],
     ]
-    assert batch["target_ids"][0].tolist() == [ids[1], ids[2], pad, eos]
+    assert batch["target_ids"][0].tolist() == list(ids[1:])
     assert batch["target_ids"][1].tolist() == list(ids[1:])
-    assert int((batch["target_ids"] != pad).sum().item()) == 7
-    assert torch.equal(
-        batch["target_ids"] != pad,
-        batch["loss_mask"],
-    )
+    assert batch["target_ids"][0, 2].item() == ids[3]
+    assert int((batch["target_ids"] != pad).sum().item()) == 8
 
 
 @pytest.mark.parametrize(
@@ -627,7 +647,7 @@ def test_collate_rejects_pre_padded_or_inconsistent_samples() -> None:
     sample = {
         "input_ids": (1, 3),
         "target_ids": (3, 2),
-        "loss_mask": (True, True),
+        "unknown_technique_decision_mask": (False, False),
         "length": 2,
         "sequence_id": "valid-sequence",
         "split": "train",
@@ -643,19 +663,28 @@ def test_collate_rejects_pre_padded_or_inconsistent_samples() -> None:
             [{**sample, "length": 3}],
             pad_token_id=0,
         )
-    with pytest.raises(DatasetContractError, match="missing field.*loss_mask"):
+    with pytest.raises(
+        DatasetContractError,
+        match="missing field.*unknown_technique_decision_mask",
+    ):
         collate_token_sequences(
-            [{key: value for key, value in sample.items() if key != "loss_mask"}],
+            [
+                {
+                    key: value
+                    for key, value in sample.items()
+                    if key != "unknown_technique_decision_mask"
+                }
+            ],
             pad_token_id=0,
         )
     with pytest.raises(DatasetContractError, match="must be boolean"):
         collate_token_sequences(
-            [{**sample, "loss_mask": (True, 1)}],
+            [{**sample, "unknown_technique_decision_mask": (False, 1)}],
             pad_token_id=0,
         )
     with pytest.raises(DatasetContractError, match="lengths must match"):
         collate_token_sequences(
-            [{**sample, "loss_mask": (True,)}],
+            [{**sample, "unknown_technique_decision_mask": (False,)}],
             pad_token_id=0,
         )
     with pytest.raises(DatasetContractError, match="empty batch"):

@@ -66,16 +66,21 @@ Stage 3 training is implemented as well. It:
 - builds strict autoregressive train and validation datasets only from the
   entries in the authoritative Stage 2 manifest, verifying their hashes and
   refusing to silently truncate sequences;
-- masks the post-`Duration` technique decision from loss for `UNLABELED`
-  sequences, so legacy files still teach notes and rhythm without becoming
-  false negative technique examples; `COMPLETE` examples remain fully trained;
+- keeps the real structural target after `Duration` in `UNLABELED` sequences,
+  but computes that decision with a restricted softmax that excludes only the
+  six unknown technique classes. Legacy files therefore still teach the next
+  pitch, position, bar, bend, or end token without becoming false-negative
+  technique examples; `COMPLETE` examples use the full vocabulary;
 - shifts each sequence into input/next-token targets and pads each batch only
   to its longest member, using the reserved `PAD` token;
 - trains the configured two-layer GRU with AdamW and token-weighted
   cross-entropy that ignores padding, gradient clipping, deterministic seeds,
   CPU/CUDA selection, and optional CUDA mixed precision;
-- evaluates the validation split after every epoch and records loss,
-  perplexity, token counts, gradient norm, learning rate, and epoch duration;
+- evaluates the validation split after every epoch and records objective and
+  full-vocabulary NLL/perplexity, token top-1/top-5 accuracy, whether the top-1
+  token has the correct event type, a breakdown by target type, a dedicated
+  post-`Duration` unknown
+  slice, token counts, gradient norm, learning rate, and epoch duration;
 - writes TensorBoard events, a JSON training report, and atomic `best.pt`,
   `latest.pt`, and periodic epoch checkpoints in an isolated training-run
   directory; and
@@ -319,6 +324,10 @@ baseline. Checkpoints trained against an older tokenization manifest are
 intentionally incompatible; preprocess, tokenize, and start a new training run
 after this migration.
 
+The partial-label post-`Duration` objective also uses checkpoint schema 2.
+Schema-1 checkpoints remain loadable for generation, but cannot be resumed for
+training because their optimization objective and epoch metrics are different.
+
 Train the GRU using the authoritative token manifest:
 
 ```bash
@@ -355,6 +364,11 @@ Inspect the live and saved metrics with:
 ```bash
 tensorboard --logdir outputs/logs/training
 ```
+
+The same per-epoch diagnostics are stored under `history[].train_metrics` and
+`history[].validation_metrics` in `training_report.json`. `objective_nll` is
+the loss actually optimized; `full_vocab_nll` is a diagnostic that leaves the
+technique classes in the denominator even when their labels are unknown.
 
 Generate four unconditional ideas with the exact checkpoint and tokenization
 manifest configured in `configs/generate.yaml`:
@@ -536,17 +550,22 @@ El entrenamiento de la Etapa 3 también está implementado. Esta etapa:
 - construye datasets autorregresivos estrictos de entrenamiento y validación
   únicamente desde las entradas del manifiesto autoritativo de la Etapa 2,
   verifica sus hashes y nunca trunca secuencias silenciosamente;
-- excluye de la pérdida la decisión técnica posterior a `Duration` en
-  secuencias `UNLABELED`, de modo que los archivos antiguos enseñen notas y
-  ritmo sin convertirse en falsos negativos; los ejemplos `COMPLETE` sí se
-  entrenan íntegramente;
+- conserva el target estructural real posterior a `Duration` en secuencias
+  `UNLABELED`, pero calcula esa decisión con un softmax restringido que excluye
+  únicamente las seis clases técnicas desconocidas. Así, los archivos antiguos
+  siguen enseñando el siguiente pitch, posición, compás, bend o fin sin
+  convertirse en falsos negativos; los ejemplos `COMPLETE` usan el vocabulario
+  completo;
 - desplaza cada secuencia para formar pares entrada/token siguiente y rellena
   cada batch solo hasta su miembro más largo, usando el token `PAD` reservado;
 - entrena la GRU configurada de dos capas con AdamW, cross-entropy ponderada por
   token que ignora el padding, gradient clipping, semillas deterministas,
   selección CPU/CUDA y precisión mixta opcional en CUDA;
-- evalúa el split de validación después de cada época y registra loss,
-  perplexity, cantidad de tokens, norma del gradiente, learning rate y duración;
+- evalúa el split de validación después de cada época y registra NLL/perplexity
+  del objetivo y del vocabulario completo, precisión top-1/top-5 de token, si el
+  token top-1 tiene el tipo de evento correcto, desglose por tipo de target, una
+  categoría específica para decisiones post-`Duration` sin etiqueta técnica,
+  cantidad de tokens, norma del gradiente, learning rate y duración;
 - escribe eventos de TensorBoard, un reporte JSON y checkpoints atómicos
   `best.pt`, `latest.pt` y periódicos dentro de una carpeta aislada por corrida;
   y
@@ -798,6 +817,11 @@ notas. Los checkpoints entrenados con un manifiesto de tokenización antiguo son
 deliberadamente incompatibles: después de esta migración hay que preprocesar,
 tokenizar e iniciar un entrenamiento nuevo.
 
+El objetivo parcial posterior a `Duration` también usa el schema 2 de
+checkpoints. Los checkpoints schema 1 todavía se pueden cargar para generar,
+pero no se pueden reanudar para entrenar porque usan otro objetivo y otras
+métricas por época.
+
 Entrena la GRU desde el manifiesto autoritativo de tokens:
 
 ```bash
@@ -836,6 +860,12 @@ Inspecciona las métricas guardadas y en vivo con:
 ```bash
 tensorboard --logdir outputs/logs/training
 ```
+
+Los mismos diagnósticos por época se guardan en
+`history[].train_metrics` y `history[].validation_metrics` dentro de
+`training_report.json`. `objective_nll` es la pérdida realmente optimizada;
+`full_vocab_nll` es un diagnóstico que conserva las clases técnicas en el
+denominador incluso cuando sus etiquetas son desconocidas.
 
 Genera cuatro ideas incondicionales con el checkpoint y el manifiesto de
 tokens indicados explícitamente en `configs/generate.yaml`:

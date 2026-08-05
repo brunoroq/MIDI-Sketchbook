@@ -8,7 +8,8 @@ paths:
   tokenization_manifest: data/tokenized/manifest.json
   checkpoints_dir: checkpoints
   tensorboard_log_dir: outputs/logs/training
-  # Must be a run's latest.pt inside checkpoints_dir when set.
+  # Must be a schema-2 run's latest.pt inside checkpoints_dir when set.
+  # Leave null to start from epoch 1; schema-1 checkpoints cannot be resumed.
   resume_from: null
 
 model:
