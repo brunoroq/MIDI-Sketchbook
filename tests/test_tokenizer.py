@@ -9,6 +9,7 @@ from miditok import REMI, TokenizerConfig
 import pretty_midi
 import pytest
 
+from midi_idea_generator.tonality import MODE_NAMES, TONIC_NAMES
 from midi_idea_generator.tokenization_config import (
     GUITAR_TECHNIQUE_TOKENS,
     PITCH_BEND_RANGE,
@@ -16,17 +17,23 @@ from midi_idea_generator.tokenization_config import (
     RemiTokenizerConfig,
 )
 from midi_idea_generator.tokenizer import (
+    CONDITIONING_SCHEMA_VERSION,
+    ConditionedGuitarREMI,
     GuitarREMI,
+    MODE_TOKENS,
     TECHNIQUE_TOKEN_BY_TYPE,
     TECHNIQUE_TYPES,
+    TONIC_TOKENS,
     TechniqueAnnotation,
     TokenizationError,
     build_tokenizer,
     decode_symbolic_token_ids,
     decode_token_ids,
     encode_midi,
+    get_mode_token_ids,
     get_special_token_ids,
     get_technique_token_ids,
+    get_tonic_token_ids,
     load_tokenizer,
     save_tokenizer,
 )
@@ -54,7 +61,7 @@ def _write_guitar_midi(
 def test_build_tokenizer_translates_config_and_disables_unused_features() -> None:
     tokenizer = build_tokenizer(RemiTokenizerConfig())
 
-    assert isinstance(tokenizer, GuitarREMI)
+    assert type(tokenizer) is ConditionedGuitarREMI
     assert tokenizer.one_token_stream is False
     assert tokenizer.config.pitch_range == (21, 108)
     assert tokenizer.config.beat_res == {(0, 4): 24, (4, 16): 4}
@@ -93,9 +100,12 @@ def test_techniques_are_ordinary_postfix_tokens_with_a_strict_graph() -> None:
     technique_ids = get_technique_token_ids(tokenizer)
 
     assert tuple(technique_ids) == TECHNIQUE_TYPES
-    assert tuple(tokenizer.vocab)[-len(GUITAR_TECHNIQUE_TOKENS) :] == (
-        GUITAR_TECHNIQUE_TOKENS
-    )
+    vocabulary = tuple(tokenizer.vocab)
+    assert vocabulary[-len(MODE_TOKENS) :] == MODE_TOKENS
+    tonic_start = -(len(MODE_TOKENS) + len(TONIC_TOKENS))
+    assert vocabulary[tonic_start : -len(MODE_TOKENS)] == TONIC_TOKENS
+    technique_start = tonic_start - len(GUITAR_TECHNIQUE_TOKENS)
+    assert vocabulary[technique_start:tonic_start] == GUITAR_TECHNIQUE_TOKENS
     assert tokenizer.config.special_tokens == ["PAD_None", "BOS_None", "EOS_None"]
     assert "Technique" in tokenizer.tokens_types_graph["Duration"]
     assert tokenizer.tokens_types_graph["Technique"] == (
@@ -107,6 +117,10 @@ def test_techniques_are_ordinary_postfix_tokens_with_a_strict_graph() -> None:
         if "Technique" in successors and token_type not in {"PAD", "BOS", "EOS"}
     }
     assert musical_predecessors == {"Duration", "Technique"}
+    assert tokenizer.tokens_types_graph["Tonic"] - {"PAD", "EOS"} == {"Mode"}
+    assert tokenizer.tokens_types_graph["Mode"] - {"PAD", "EOS"} == {"Bar"}
+    assert tuple(get_tonic_token_ids(tokenizer)) == TONIC_NAMES
+    assert tuple(get_mode_token_ids(tokenizer)) == MODE_NAMES
 
 
 @pytest.mark.parametrize(
@@ -133,13 +147,16 @@ def test_encode_adds_resolved_boundaries_without_pad_and_round_trips(
     )
     tokenizer = build_tokenizer(RemiTokenizerConfig())
 
-    encoded = encode_midi(tokenizer, midi_path)
+    encoded = encode_midi(tokenizer, midi_path, tonic="E", mode="PHRYGIAN")
     special_ids = get_special_token_ids(tokenizer)
 
     assert encoded.ids[0] == special_ids.bos
     assert encoded.ids[-1] == special_ids.eos
     assert special_ids.pad not in encoded.ids
     assert encoded.ids[1:-1] == encoded.musical_ids
+    assert tokenizer[encoded.ids[1]] == "Tonic_E"
+    assert tokenizer[encoded.ids[2]] == "Mode_PHRYGIAN"
+    assert tokenizer[encoded.ids[3]] == "Bar_None"
     assert encoded.num_tokens == len(encoded.ids)
     assert encoded.num_musical_tokens == len(encoded.musical_ids)
     assert encoded.num_tokens == encoded.num_musical_tokens + 2
@@ -147,6 +164,7 @@ def test_encode_adds_resolved_boundaries_without_pad_and_round_trips(
     assert encoded.num_notes == 3
     assert encoded.num_pitch_bends == 0
     assert encoded.techniques == ()
+    assert (encoded.tonic, encoded.mode) == ("E", "PHRYGIAN")
     assert encoded.token_error_ratio == 0.0
     assert encoded.round_trip_ok is True
 
@@ -194,6 +212,48 @@ def test_native_pitch_bends_include_exact_zero_and_round_trip(
         0,
     ]
     assert decoded.techniques == ()
+
+
+def test_condition_prefix_is_exact_and_survives_symbolic_round_trip(
+    tmp_path: Path, make_instrument, write_midi_file
+) -> None:
+    path = _write_guitar_midi(
+        tmp_path / "conditioned.mid", make_instrument, write_midi_file
+    )
+    tokenizer = build_tokenizer(RemiTokenizerConfig())
+    encoded = encode_midi(tokenizer, path, tonic="f#", mode="natural minor")
+    decoded = decode_symbolic_token_ids(tokenizer, encoded.ids, encoded.programs)
+
+    assert (encoded.tonic, encoded.mode) == ("F_SHARP", "MINOR")
+    assert (decoded.tonic, decoded.mode) == ("F_SHARP", "MINOR")
+    assert [tokenizer[token_id] for token_id in encoded.ids[:4]] == [
+        "BOS_None",
+        "Tonic_F_SHARP",
+        "Mode_MINOR",
+        "Bar_None",
+    ]
+
+    missing_tonic = (encoded.ids[0], *encoded.ids[2:])
+    with pytest.raises(TokenizationError, match="exactly one Tonic"):
+        decode_symbolic_token_ids(tokenizer, missing_tonic, encoded.programs)
+
+    reversed_prefix = (
+        encoded.ids[0],
+        encoded.ids[2],
+        encoded.ids[1],
+        *encoded.ids[3:],
+    )
+    with pytest.raises(TokenizationError, match="exactly one Tonic"):
+        decode_symbolic_token_ids(tokenizer, reversed_prefix, encoded.programs)
+
+    duplicated_tonic = (*encoded.ids[:-1], encoded.ids[1], encoded.ids[-1])
+    with pytest.raises(TokenizationError, match="exactly one Tonic"):
+        decode_symbolic_token_ids(tokenizer, duplicated_tonic, encoded.programs)
+
+    with pytest.raises(TokenizationError, match="Invalid tonal conditioning"):
+        encode_midi(tokenizer, path, tonic="H", mode="MINOR")
+    with pytest.raises(TokenizationError, match="Mode must be UNKNOWN"):
+        encode_midi(tokenizer, path, tonic="UNKNOWN", mode="MINOR")
 
 
 def test_all_techniques_are_postfix_and_survive_symbolic_round_trip(
@@ -288,12 +348,15 @@ def test_saved_tokenizer_reloads_with_identical_encoding(
     restored = load_tokenizer(tokenizer_path)
     after = encode_midi(restored, midi_path)
 
-    assert isinstance(restored, GuitarREMI)
+    assert type(restored) is ConditionedGuitarREMI
     assert restored.vocab == tokenizer.vocab
     assert get_special_token_ids(restored) == get_special_token_ids(tokenizer)
     assert get_technique_token_ids(restored) == get_technique_token_ids(tokenizer)
     payload = json.loads(tokenizer_path.read_text(encoding="utf-8"))
-    assert payload["tokenization"] == "GuitarREMI"
+    assert payload["tokenization"] == "ConditionedGuitarREMI"
+    assert payload["conditioning_schema_version"] == CONDITIONING_SCHEMA_VERSION
+    assert payload["tonic_names"] == list(TONIC_NAMES)
+    assert payload["mode_names"] == list(MODE_NAMES)
     assert payload["guitar_technique_tokens"] == list(GUITAR_TECHNIQUE_TOKENS)
     assert payload["pitch_bend_sensitivity_semitones"] == 6
     assert after.ids == before.ids
@@ -331,6 +394,16 @@ def test_save_rejects_reserved_metadata_override_and_loads_legacy_remi(
     assert type(restored) is REMI
     with pytest.raises(TokenizationError, match="does not define technique token"):
         get_technique_token_ids(restored)
+
+    legacy_guitar = GuitarREMI(tokenizer_config=tokenizer.config)
+    legacy_guitar_path = save_tokenizer(
+        legacy_guitar, tmp_path / "legacy-guitar.json"
+    )
+    restored_guitar = load_tokenizer(legacy_guitar_path)
+
+    assert type(restored_guitar) is GuitarREMI
+    with pytest.raises(TokenizationError, match="does not define tonic token"):
+        get_tonic_token_ids(restored_guitar)
 
 
 def test_load_rejects_corrupt_guitar_metadata(tmp_path: Path) -> None:

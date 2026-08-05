@@ -1,20 +1,26 @@
 seed: 42
 device: auto
 
+conditioning:
+  tonic: E
+  mode: PHRYGIAN
+
 paths:
-  checkpoint: checkpoints/20260805T013033Z-cc438e945e/best.pt
+  # One-epoch conditioned smoke checkpoint. Replace it with the next full
+  # training run's best.pt.
+  checkpoint: checkpoints/20260805T202433Z-edbbc7d16a/best.pt
   tokenization_manifest: data/tokenized/manifest.json
   output_dir: outputs/generated
 
 generation:
   min_tokens: 32
   max_tokens: 256
-  temperature: 0.9
-  top_k: 20
-  top_p: 0.95
-  repetition_penalty: 1.05
+  temperature: 0.65
+  top_k: 5
+  top_p: 0.80
+  repetition_penalty: 1.0
   max_simultaneous_notes: 3
-  num_samples: 4
+  num_samples: 8
   max_attempts_per_sample: 25
 
 midi:

@@ -32,6 +32,8 @@ preprocessing. The executable workflow can:
 - load optional hash-linked `*.mid.techniques.json` sidecars for dead notes,
   palm mute, slide direction, and vibrato, without treating an unannotated
   legacy MIDI as a confirmed negative example;
+- infer tonic and mode from the normalized musical material, with optional
+  hash-linked `*.mid.tonality.json` overrides for reviewed examples;
 - collapse exact duplicate unison notes while retaining strict checks for
   unsupported musical controls;
 - split material into configurable phrases of 2, 4, or 8 bars;
@@ -48,9 +50,9 @@ Stage 2 REMI tokenization is also implemented. It:
 
 - consumes only the fragments named by the authoritative Stage 1 manifest,
   never every file found under `data/processed`;
-- encodes each one-track phrase with MidiTok 3, adds explicit `BOS` and `EOS`
-  tokens, and reserves `PAD` for the Stage 3 data loader without storing it in
-  the unpadded sequences;
+- encodes each one-track phrase with MidiTok 3 as
+  `BOS → Tonic → Mode → Bar… → EOS`, and reserves `PAD` for the Stage 3 data
+  loader without storing it in the unpadded sequences;
 - validates every sequence with an encode/decode/re-encode round trip while
   retaining the MIDI instrument program as out-of-band metadata;
 - uses the local `GuitarREMI` vocabulary: native `PitchBend` events plus six
@@ -66,29 +68,38 @@ Stage 3 training is implemented as well. It:
 - builds strict autoregressive train and validation datasets only from the
   entries in the authoritative Stage 2 manifest, verifying their hashes and
   refusing to silently truncate sequences;
-- masks the post-`Duration` technique decision from loss for `UNLABELED`
-  sequences, so legacy files still teach notes and rhythm without becoming
-  false negative technique examples; `COMPLETE` examples remain fully trained;
+- keeps the real structural target after `Duration` in `UNLABELED` sequences,
+  but computes that decision with a restricted softmax that excludes only the
+  six unknown technique classes. Legacy files therefore still teach the next
+  pitch, position, bar, bend, or end token without becoming false-negative
+  technique examples; `COMPLETE` examples use the full vocabulary;
 - shifts each sequence into input/next-token targets and pads each batch only
   to its longest member, using the reserved `PAD` token;
+- treats the supplied `Tonic` and `Mode` prefix as conditioning context rather
+  than targets to guess, while retaining their recurrent influence and
+  downstream gradients from `Bar` onward;
 - trains the configured two-layer GRU with AdamW and token-weighted
   cross-entropy that ignores padding, gradient clipping, deterministic seeds,
   CPU/CUDA selection, and optional CUDA mixed precision;
-- evaluates the validation split after every epoch and records loss,
-  perplexity, token counts, gradient norm, learning rate, and epoch duration;
+- evaluates the validation split after every epoch and records objective and
+  full-vocabulary NLL/perplexity, token top-1/top-5 accuracy, whether the top-1
+  token has the correct event type, a breakdown by target type, a dedicated
+  post-`Duration` unknown
+  slice, token counts, gradient norm, learning rate, and epoch duration;
 - writes TensorBoard events, a JSON training report, and atomic `best.pt`,
   `latest.pt`, and periodic epoch checkpoints in an isolated training-run
   directory; and
 - resumes only from a compatible checkpoint, restoring model, optimizer,
   scaler, data-loader, and random-number-generator state before continuing.
 
-Stage 4 has a first unconditional generator. It:
+Stage 4 has a first tonic/mode-conditioned generator from scratch. It:
 
 - safely loads `best.pt` on CPU first, verifies its exact manifest, tokenizer,
   vocabulary, architecture, state tensors, and hashes, and only then moves the
   model to the requested CPU or CUDA device;
-- samples reproducibly from `BOS` without a seed MIDI using temperature,
-  top-k, top-p, repetition penalty, a token limit, and bounded retries;
+- forces the configured tonic/mode prefix and then samples reproducibly without
+  a seed MIDI using temperature, top-k, top-p, repetition penalty, a token
+  limit, and bounded retries;
 - constrains token types and values to valid GuitarREMI continuations, limits
   simultaneous guitar notes, rejects overlapping same-pitch notes, and
   validates every decoded sequence before publishing it;
@@ -99,9 +110,9 @@ Stage 4 has a first unconditional generator. It:
 - publishes each complete run atomically under `outputs/generated/<run_id>/`
   with SHA-256 hashes in a run manifest and never overwrites prior samples.
 
-Generation conditioned by a seed MIDI is **not implemented yet**. The current
-checkpoint is a one-epoch smoke model, so its outputs prove the complete path
-rather than represent a musically mature model.
+Generation conditioned by a seed MIDI is **not implemented yet**. After the
+tonality-language migration, train a new checkpoint from scratch; older
+checkpoints remain useful only as historical baselines with their old manifest.
 
 ## Architecture and main decisions
 
@@ -147,9 +158,12 @@ an explicitly declared and constant source sensitivity and actual excursions
 no wider than +/-6 semitones, and monophonic or modestly polyphonic material.
 Techniques that ordinary MIDI
 cannot distinguish use the optional strict sidecar contract documented in
-[`docs/technique-sidecars.md`](docs/technique-sidecars.md). The source
+[`docs/technique-sidecars.md`](docs/technique-sidecars.md). The tonality
+workflow and manual override are documented in
+[`docs/tonality-conditioning.md`](docs/tonality-conditioning.md). The source
 file—not a derived phrase—is the unit of dataset splitting. Transposition
-never changes that source split.
+never changes that source split and moves the tonic by the same interval while
+leaving the mode unchanged.
 
 `track_number` in the manifest is retained to match the project requirement,
 but in Stage 1 it means the zero-based index in `pretty_midi.instruments`. It
@@ -253,6 +267,9 @@ For reviewed material, add the sibling sidecar described in
 `COMPLETE` sidecar explicitly means “reviewed and contains no supported
 techniques.” Keep the original Guitar Pro or MusicXML files as well: standard
 MIDI cannot reliably tell a slide from a bend or recover every articulation.
+Tonic and mode are inferred automatically by default. Review or override
+uncertain labels with the much smaller sidecar described in
+[`docs/tonality-conditioning.md`](docs/tonality-conditioning.md).
 
 The default pitch range is MIDI 21–108. Missing time-signature events may be
 treated as 4/4, but explicit non-4/4 events are rejected. Quantization is off
@@ -289,6 +306,12 @@ Preprocess and build the leakage-safe splits and manifest:
 python scripts/preprocess.py --config configs/preprocess.yaml
 ```
 
+Review automatic tonic/mode estimates, least-confident mode first:
+
+```bash
+python scripts/report_tonalities.py
+```
+
 Tokenize the current Stage 1 manifest with REMI:
 
 ```bash
@@ -308,16 +331,21 @@ data/tokenized/manifest.json       authoritative current-run manifest
 ```
 
 The authoritative manifests report the live corpus size, accepted/rejected
-sources, split counts, technique coverage, bend-token counts, and sequence
-lengths. These values are intentionally not hard-coded here because `data/raw`
-is a growing private collection. Stage 2 never truncates or pads stored files;
+sources, split counts, tonic/mode distributions, technique coverage,
+bend-token counts, and sequence lengths. These values are intentionally not
+hard-coded here because `data/raw` is a growing private collection. Stage 2
+never truncates or pads stored files;
 Stage 3 applies dynamic padding and rejects any sequence above the configured
 maximum instead of silently shortening it.
 
-The GuitarREMI vocabulary and schema differ from the earlier note-only
+The conditioned GuitarREMI vocabulary and schema differ from the earlier
 baseline. Checkpoints trained against an older tokenization manifest are
 intentionally incompatible; preprocess, tokenize, and start a new training run
 after this migration.
+
+The partial-label post-`Duration` objective also uses checkpoint schema 2.
+Schema-1 checkpoints remain loadable for generation, but cannot be resumed for
+training because their optimization objective and epoch metrics are different.
 
 Train the GRU using the authoritative token manifest:
 
@@ -356,8 +384,13 @@ Inspect the live and saved metrics with:
 tensorboard --logdir outputs/logs/training
 ```
 
-Generate four unconditional ideas with the exact checkpoint and tokenization
-manifest configured in `configs/generate.yaml`:
+The same per-epoch diagnostics are stored under `history[].train_metrics` and
+`history[].validation_metrics` in `training_report.json`. `objective_nll` is
+the loss actually optimized; `full_vocab_nll` is a diagnostic that leaves the
+technique classes in the denominator even when their labels are unknown.
+
+Generate tonic/mode-conditioned ideas with the exact checkpoint and
+tokenization manifest configured in `configs/generate.yaml`:
 
 ```bash
 python scripts/generate.py --config configs/generate.yaml
@@ -400,11 +433,11 @@ default 50-epoch configuration includes validation-based early stopping after
 8 epochs without sufficient improvement and saves enough state for an exact,
 compatible continuation.
 
-Unconditional generation is available through `scripts/generate.py`. It uses a
-reproducible random seed, maximum/minimum token counts, temperature, top-k,
-top-p, sample count, repetition penalty, a simultaneous-note cap, and bounded
-retries. Invalid decoded MIDI is never published. Conditional continuation
-from a seed MIDI remains future work.
+Tonic/mode-conditioned generation is available through `scripts/generate.py`.
+It uses a reproducible random seed, maximum/minimum token counts, temperature,
+top-k, top-p, sample count, repetition penalty, a simultaneous-note cap, and
+bounded retries. Invalid decoded MIDI is never published. Conditional
+continuation from a seed MIDI remains future work.
 
 ## Limitations
 
@@ -420,6 +453,8 @@ from a seed MIDI remains future work.
 - Lyrics, audio, tablature strings/frets, pick direction, and other guitar
   fingering remain outside the current language.
 - Rhythm augmentation is not implemented.
+- Automatic tonic/mode analysis is a deterministic heuristic, not ground truth;
+  ambiguous or modulating material should be reviewed or manually overridden.
 - Simple polyphony is accepted, but complex multi-track arrangement semantics
   are not preserved.
 - Exact duplicate unisons are collapsed. Non-identical overlapping note-on
@@ -452,10 +487,10 @@ from a seed MIDI remains future work.
 4. **Done:** compact GRU, CPU/CUDA training, validation, gradient clipping,
    compatible exact resume, atomic checkpoints, early stopping, reports, and
    TensorBoard metrics.
-5. **Done:** reproducible unconditional temperature/top-k/top-p sampling,
-   GuitarREMI constraints, strict checkpoint provenance, MIDI/bend export,
-   generated-technique metadata, piano-roll images, and immutable manifests in
-   `outputs/generated/`.
+5. **Done:** reproducible tonic/mode-conditioned temperature/top-k/top-p
+   sampling, GuitarREMI constraints, strict checkpoint provenance, MIDI/bend
+   export, generated-technique metadata, piano-roll images, and immutable
+   manifests in `outputs/generated/`.
 6. Add seed-MIDI conditioning, model-quality evaluation, and an audition/
    curation workflow after training on the expanded corpus.
 
@@ -502,6 +537,8 @@ preprocesamiento básico. El flujo ejecutable permite:
 - cargar sidecars opcionales `*.mid.techniques.json`, ligados por hash, para
   notas muertas, palm mute, dirección de slide y vibrato, sin interpretar un
   MIDI antiguo no anotado como ejemplo negativo confirmado;
+- inferir tónica y modo desde el material normalizado y aceptar correcciones
+  opcionales revisadas mediante sidecars `*.mid.tonality.json` ligados por hash;
 - colapsar unísonos duplicados exactos y mantener controles estrictos para
   eventos musicales no soportados;
 - dividir el material en frases configurables de 2, 4 u 8 compases;
@@ -518,9 +555,9 @@ La tokenización REMI de la Etapa 2 también está implementada. Esta etapa:
 
 - consume únicamente los fragmentos enumerados por el manifiesto autoritativo
   de la Etapa 1, sin recorrer todos los archivos de `data/processed`;
-- codifica cada frase de una pista con MidiTok 3, agrega tokens `BOS` y `EOS`
-  explícitos y reserva `PAD` para el data loader de la Etapa 3 sin guardarlo
-  dentro de las secuencias aún no rellenadas;
+- codifica cada frase de una pista con MidiTok 3 como
+  `BOS → Tonic → Mode → Bar… → EOS` y reserva `PAD` para el data loader de la
+  Etapa 3 sin guardarlo dentro de las secuencias aún no rellenadas;
 - valida cada secuencia mediante codificación/decodificación/recodificación y
   conserva el programa del instrumento MIDI como metadata fuera del stream;
 - usa el vocabulario local `GuitarREMI`: eventos `PitchBend` nativos y seis
@@ -536,31 +573,40 @@ El entrenamiento de la Etapa 3 también está implementado. Esta etapa:
 - construye datasets autorregresivos estrictos de entrenamiento y validación
   únicamente desde las entradas del manifiesto autoritativo de la Etapa 2,
   verifica sus hashes y nunca trunca secuencias silenciosamente;
-- excluye de la pérdida la decisión técnica posterior a `Duration` en
-  secuencias `UNLABELED`, de modo que los archivos antiguos enseñen notas y
-  ritmo sin convertirse en falsos negativos; los ejemplos `COMPLETE` sí se
-  entrenan íntegramente;
+- conserva el target estructural real posterior a `Duration` en secuencias
+  `UNLABELED`, pero calcula esa decisión con un softmax restringido que excluye
+  únicamente las seis clases técnicas desconocidas. Así, los archivos antiguos
+  siguen enseñando el siguiente pitch, posición, compás, bend o fin sin
+  convertirse en falsos negativos; los ejemplos `COMPLETE` usan el vocabulario
+  completo;
 - desplaza cada secuencia para formar pares entrada/token siguiente y rellena
   cada batch solo hasta su miembro más largo, usando el token `PAD` reservado;
+- trata el prefijo suministrado `Tonic`/`Mode` como contexto condicionante, no
+  como targets que deba adivinar, conservando su influencia recurrente y sus
+  gradientes posteriores desde `Bar`;
 - entrena la GRU configurada de dos capas con AdamW, cross-entropy ponderada por
   token que ignora el padding, gradient clipping, semillas deterministas,
   selección CPU/CUDA y precisión mixta opcional en CUDA;
-- evalúa el split de validación después de cada época y registra loss,
-  perplexity, cantidad de tokens, norma del gradiente, learning rate y duración;
+- evalúa el split de validación después de cada época y registra NLL/perplexity
+  del objetivo y del vocabulario completo, precisión top-1/top-5 de token, si el
+  token top-1 tiene el tipo de evento correcto, desglose por tipo de target, una
+  categoría específica para decisiones post-`Duration` sin etiqueta técnica,
+  cantidad de tokens, norma del gradiente, learning rate y duración;
 - escribe eventos de TensorBoard, un reporte JSON y checkpoints atómicos
   `best.pt`, `latest.pt` y periódicos dentro de una carpeta aislada por corrida;
   y
 - reanuda únicamente un checkpoint compatible, restaurando el modelo,
   optimizador, scaler, data loader y los generadores aleatorios antes de seguir.
 
-La Etapa 4 ya incluye una primera generación incondicional. Esta etapa:
+La Etapa 4 ya incluye una primera generación desde cero condicionada por
+tónica y modo. Esta etapa:
 
 - carga `best.pt` primero en CPU, comprueba su manifiesto, tokenizer,
   vocabulario, arquitectura, tensores e identidades SHA-256 exactas, y solo
   después mueve el modelo al dispositivo CPU o CUDA solicitado;
-- muestrea de forma reproducible desde `BOS`, sin MIDI semilla, usando
-  temperature, top-k, top-p, penalización de repetición, límite de tokens e
-  intentos acotados;
+- fuerza el prefijo de tónica/modo configurado y luego muestrea de forma
+  reproducible, sin MIDI semilla, usando temperature, top-k, top-p,
+  penalización de repetición, límite de tokens e intentos acotados;
 - restringe tipos y valores a continuaciones GuitarREMI válidas, limita las
   notas simultáneas de guitarra, rechaza notas superpuestas del mismo pitch y
   valida cada secuencia decodificada antes de publicarla;
@@ -572,8 +618,9 @@ La Etapa 4 ya incluye una primera generación incondicional. Esta etapa:
   `outputs/generated/<run_id>/`, con hashes, sin sobrescribir muestras previas.
 
 La continuación condicionada por un MIDI semilla **todavía no está
-implementada**. El checkpoint actual es una prueba de una sola época: demuestra
-el flujo completo, pero aún no representa un modelo musicalmente maduro.
+implementada**. Después de migrar al lenguaje tonal hay que entrenar un
+checkpoint nuevo desde cero; los anteriores quedan como baselines históricos
+ligados a su manifiesto antiguo.
 
 ## Arquitectura y decisiones principales
 
@@ -620,9 +667,12 @@ constante por fragmento, pitch bends con sensibilidad fuente explícita y
 constante cuya excursión real no supere +/-6 semitonos, y material monofónico
 o con polifonía sencilla. Las técnicas
 que un MIDI común no puede distinguir usan el contrato opcional y estricto de
-[`docs/technique-sidecars.md`](docs/technique-sidecars.md). La unidad para
-dividir el dataset es el archivo fuente, no la frase derivada. La transposición
-nunca cambia el split de origen.
+[`docs/technique-sidecars.md`](docs/technique-sidecars.md). El análisis tonal y
+su corrección manual están documentados en
+[`docs/tonality-conditioning.md`](docs/tonality-conditioning.md). La unidad
+para dividir el dataset es el archivo fuente, no la frase derivada. La
+transposición nunca cambia el split de origen: mueve la tónica por el mismo
+intervalo y conserva el modo.
 
 El campo `track_number` se conserva en el manifiesto para cumplir el contrato
 del proyecto, pero en esta etapa significa el índice base cero dentro de
@@ -731,6 +781,9 @@ material revisado, agrega el sidecar hermano descrito en
 soportadas». Conserva además los originales Guitar Pro o MusicXML: el MIDI
 estándar no permite distinguir de forma fiable un slide de un bend ni recuperar
 todas las articulaciones.
+La tónica y el modo se infieren automáticamente por defecto. Revisa o corrige
+los casos dudosos con el sidecar mucho más pequeño descrito en
+[`docs/tonality-conditioning.md`](docs/tonality-conditioning.md).
 
 El rango predeterminado es MIDI 21–108. Los eventos de compás ausentes pueden
 interpretarse como 4/4, pero se rechazan eventos explícitos distintos de 4/4.
@@ -768,6 +821,13 @@ Preprocesa, crea splits seguros y escribe el manifiesto:
 python scripts/preprocess.py --config configs/preprocess.yaml
 ```
 
+Revisa las estimaciones automáticas de tónica/modo, comenzando por los modos de
+menor confianza:
+
+```bash
+python scripts/report_tonalities.py
+```
+
 Tokeniza con REMI el manifiesto vigente de la Etapa 1:
 
 ```bash
@@ -787,16 +847,22 @@ data/tokenized/manifest.json       manifiesto autoritativo de la corrida actual
 ```
 
 Los manifiestos autoritativos informan el tamaño vivo del corpus, fuentes
-aceptadas/rechazadas, splits, cobertura de técnicas, tokens de bends y longitudes
-de secuencia. Esos valores no se fijan aquí porque `data/raw` es una colección
-privada en crecimiento. La Etapa 2 nunca trunca ni rellena los archivos
+aceptadas/rechazadas, splits, distribuciones de tónica/modo, cobertura de
+técnicas, tokens de bends y longitudes de secuencia. Esos valores no se fijan
+aquí porque `data/raw` es una colección privada en crecimiento. La Etapa 2 nunca
+trunca ni rellena los archivos
 guardados; la Etapa 3 aplica padding dinámico y rechaza una secuencia que exceda
 el máximo configurado, en vez de acortarla silenciosamente.
 
-El vocabulario y schema GuitarREMI son distintos del baseline anterior de solo
-notas. Los checkpoints entrenados con un manifiesto de tokenización antiguo son
-deliberadamente incompatibles: después de esta migración hay que preprocesar,
-tokenizar e iniciar un entrenamiento nuevo.
+El vocabulario y schema GuitarREMI condicionado son distintos del baseline
+anterior. Los checkpoints entrenados con un manifiesto de tokenización antiguo
+son deliberadamente incompatibles: después de esta migración hay que
+preprocesar, tokenizar e iniciar un entrenamiento nuevo.
+
+El objetivo parcial posterior a `Duration` también usa el schema 2 de
+checkpoints. Los checkpoints schema 1 todavía se pueden cargar para generar,
+pero no se pueden reanudar para entrenar porque usan otro objetivo y otras
+métricas por época.
 
 Entrena la GRU desde el manifiesto autoritativo de tokens:
 
@@ -837,7 +903,13 @@ Inspecciona las métricas guardadas y en vivo con:
 tensorboard --logdir outputs/logs/training
 ```
 
-Genera cuatro ideas incondicionales con el checkpoint y el manifiesto de
+Los mismos diagnósticos por época se guardan en
+`history[].train_metrics` y `history[].validation_metrics` dentro de
+`training_report.json`. `objective_nll` es la pérdida realmente optimizada;
+`full_vocab_nll` es un diagnóstico que conserva las clases técnicas en el
+denominador incluso cuando sus etiquetas son desconocidas.
+
+Genera ideas condicionadas por tónica/modo con el checkpoint y el manifiesto de
 tokens indicados explícitamente en `configs/generate.yaml`:
 
 ```bash
@@ -882,11 +954,12 @@ arriba. La configuración predeterminada de 50 épocas incluye early stopping
 basado en validación después de 8 épocas sin mejora suficiente y guarda el
 estado necesario para una continuación exacta y compatible.
 
-La generación incondicional está disponible mediante `scripts/generate.py`.
-Admite semilla reproducible, límites mínimo/máximo de tokens, temperature,
-top-k, top-p, cantidad de muestras, penalización de repetición, límite de notas
-simultáneas e intentos acotados. Nunca publica un MIDI decodificado inválido.
-La continuación condicionada desde un MIDI semilla sigue siendo trabajo futuro.
+La generación condicionada por tónica y modo está disponible mediante
+`scripts/generate.py`. Admite semilla reproducible, límites mínimo/máximo de
+tokens, temperature, top-k, top-p, cantidad de muestras, penalización de
+repetición, límite de notas simultáneas e intentos acotados. Nunca publica un
+MIDI decodificado inválido. La continuación condicionada desde un MIDI semilla
+sigue siendo trabajo futuro.
 
 ## Limitaciones actuales
 
@@ -902,6 +975,8 @@ La continuación condicionada desde un MIDI semilla sigue siendo trabajo futuro.
 - Letras, audio, cuerdas/trastes de tablatura, dirección de púa y otras
   digitaciones siguen fuera del lenguaje actual.
 - El aumento rítmico no está implementado.
+- El análisis automático de tónica/modo es una heurística determinista, no una
+  verdad absoluta; conviene revisar o corregir material ambiguo o modulante.
 - Se acepta polifonía sencilla, pero no se conserva la semántica de arreglos
   multipista complejos.
 - Los unísonos duplicados exactos se colapsan. Se siguen rechazando note-on no
@@ -937,10 +1012,10 @@ La continuación condicionada desde un MIDI semilla sigue siendo trabajo futuro.
 4. **Hecho:** GRU compacta, entrenamiento CPU/CUDA, validación, gradient
    clipping, reanudación exacta y compatible, checkpoints atómicos, early
    stopping, reportes y métricas en TensorBoard.
-5. **Hecho:** muestreo incondicional reproducible con temperature/top-k/top-p,
-   restricciones GuitarREMI, procedencia estricta del checkpoint, exportación
-   MIDI/bends, metadata de técnicas generadas, piano-roll y manifiestos
-   inmutables en `outputs/generated/`.
+5. **Hecho:** muestreo reproducible condicionado por tónica/modo con
+   temperature/top-k/top-p, restricciones GuitarREMI, procedencia estricta del
+   checkpoint, exportación MIDI/bends, metadata de técnicas generadas,
+   piano-roll y manifiestos inmutables en `outputs/generated/`.
 6. Agregar condicionamiento por MIDI semilla, evaluación de calidad y un flujo
    de audición/curación después de entrenar con el corpus ampliado.
 

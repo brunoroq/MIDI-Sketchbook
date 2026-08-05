@@ -25,7 +25,7 @@ from midi_idea_generator.tokenization_pipeline import (
 
 
 _STAGE_ONE_RUN_ID = "0123456789abcdefabcd"
-_STAGE_ONE_CONFIGURATION = {"fixture": "stage-one-schema-three"}
+_STAGE_ONE_CONFIGURATION = {"fixture": "stage-one-schema-four"}
 _STAGE_ONE_CONFIG_SHA256 = sha256(
     json.dumps(
         _STAGE_ONE_CONFIGURATION,
@@ -161,12 +161,19 @@ def _make_synthetic_project(
                 "techniques": [],
                 "nominal_duration_seconds": 4.0,
                 "actual_note_duration_seconds": 1.5,
+                "tonality": {
+                    "tonic": "E",
+                    "mode": "PHRYGIAN",
+                    "method": "MANUAL",
+                    "tonic_confidence": None,
+                    "mode_confidence": None,
+                },
             }
         )
         midi_paths[split] = output_path
 
     manifest: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "run_id": _STAGE_ONE_RUN_ID,
         "processed_run_dir": processed_run_dir.relative_to(project_root).as_posix(),
         "configuration_sha256": _STAGE_ONE_CONFIG_SHA256,
@@ -230,10 +237,17 @@ def test_pipeline_publishes_all_splits_with_bounded_special_tokens(
     )
 
     manifest = json.loads(report.manifest_path.read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 2
-    assert manifest["preprocessing"]["schema_version"] == 3
+    assert manifest["schema_version"] == 3
+    assert manifest["preprocessing"]["schema_version"] == 4
     assert manifest["preprocessing"]["run_id"] == _STAGE_ONE_RUN_ID
-    assert manifest["tokenizer"]["type"] == "GuitarREMI"
+    assert manifest["tokenizer"]["type"] == "ConditionedGuitarREMI"
+    assert manifest["tokenizer"]["conditioning_schema_version"] == 1
+    assert set(manifest["tokenizer"]["tonic_token_ids"]) >= {"E", "UNKNOWN"}
+    assert set(manifest["tokenizer"]["mode_token_ids"]) >= {
+        "PHRYGIAN",
+        "BLUES",
+        "UNKNOWN",
+    }
     assert manifest["tokenizer"]["pitch_bend_sensitivity_semitones"] == 6
     assert set(manifest["tokenizer"]["technique_token_ids"]) == {
         "DEAD_NOTE",
@@ -261,6 +275,9 @@ def test_pipeline_publishes_all_splits_with_bounded_special_tokens(
         "total_tokens": 0,
         "sequences_with_pitch_bends": 0,
     }
+    assert manifest["summary"]["tonality"]["by_tonic"]["E"] == 3
+    assert manifest["summary"]["tonality"]["by_mode"]["PHRYGIAN"] == 3
+    assert manifest["summary"]["tonality"]["by_method"]["MANUAL"] == 3
     assert {
         split: manifest["summary"]["by_split"][split]["sequences"]
         for split in ("train", "validation", "test")
@@ -272,12 +289,21 @@ def test_pipeline_publishes_all_splits_with_bounded_special_tokens(
         assert sequence_path.parent == report.tokenized_run_dir / record["split"]
         payload = json.loads(sequence_path.read_text(encoding="utf-8"))
         ids = payload["ids"]
-        assert payload["schema_version"] == 2
+        assert payload["schema_version"] == 3
         assert payload["sequence_id"] == record["sequence_id"]
         assert payload["programs"] == [[30, False]]
         assert payload["technique_coverage"] == "UNLABELED"
         assert payload["techniques"] == []
+        assert payload["tonality"] == record["tonality"] == {
+            "tonic": "E",
+            "mode": "PHRYGIAN",
+            "method": "MANUAL",
+            "tonic_confidence": None,
+            "mode_confidence": None,
+        }
         assert ids[0] == special["bos"]
+        assert ids[1] == manifest["tokenizer"]["tonic_token_ids"]["E"]
+        assert ids[2] == manifest["tokenizer"]["mode_token_ids"]["PHRYGIAN"]
         assert ids[-1] == special["eos"]
         assert special["pad"] not in ids
         assert ids[1:-1]
@@ -364,6 +390,7 @@ def test_pipeline_serializes_guitar_techniques_and_native_pitch_bends(
         "programs",
         "technique_coverage",
         "techniques",
+        "tonality",
     }
     assert payload["technique_coverage"] == "COMPLETE"
     assert payload["techniques"] == fragment["techniques"]
@@ -419,6 +446,68 @@ def test_symbolic_annotations_change_sequence_identity_without_changing_midi(
         second_manifest["sequences"][0]["processed_midi_sha256"]
         == first_manifest["sequences"][0]["processed_midi_sha256"]
     )
+
+
+def test_tonality_changes_prefix_and_sequence_identity_without_changing_midi(
+    tmp_path: Path,
+    make_instrument,
+    write_midi_file,
+) -> None:
+    project = _make_synthetic_project(tmp_path, make_instrument, write_midi_file)
+    first = run_tokenization(project.config())
+    first_manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+
+    project.manifest["fragments"][0]["tonality"] = {
+        "tonic": "G",
+        "mode": "BLUES",
+        "method": "AUTO_FRAGMENT",
+        "tonic_confidence": 0.8,
+        "mode_confidence": 0.7,
+    }
+    project.write_manifest()
+    second = run_tokenization(project.config())
+    second_manifest = json.loads(second.manifest_path.read_text(encoding="utf-8"))
+    record = second_manifest["sequences"][0]
+    payload = json.loads(
+        (project.root / record["sequence_file"]).read_text(encoding="utf-8")
+    )
+
+    assert record["sequence_id"] != first_manifest["sequences"][0]["sequence_id"]
+    assert record["processed_midi_sha256"] == (
+        first_manifest["sequences"][0]["processed_midi_sha256"]
+    )
+    assert payload["tonality"] == record["tonality"]
+    assert payload["ids"][1:3] == [
+        second_manifest["tokenizer"]["tonic_token_ids"]["G"],
+        second_manifest["tokenizer"]["mode_token_ids"]["BLUES"],
+    ]
+
+
+@pytest.mark.parametrize("mutation", ["missing", "noncanonical", "confidence"])
+def test_stage_one_tonality_contract_is_strict(
+    tmp_path: Path,
+    make_instrument,
+    write_midi_file,
+    mutation: str,
+) -> None:
+    project = _make_synthetic_project(tmp_path, make_instrument, write_midi_file)
+    tonality = project.manifest["fragments"][0]["tonality"]
+    if mutation == "missing":
+        tonality.pop("mode")
+    elif mutation == "noncanonical":
+        tonality["tonic"] = "e"
+    else:
+        tonality.update(
+            {
+                "method": "AUTO_FRAGMENT",
+                "tonic_confidence": None,
+                "mode_confidence": None,
+            }
+        )
+    project.write_manifest()
+
+    with pytest.raises(TokenizationPipelineError, match="tonality"):
+        run_tokenization(project.config())
 
 
 def test_identical_rerun_reuses_a_byte_identical_immutable_run(
@@ -489,7 +578,7 @@ def test_changed_midi_and_changed_config_each_create_a_distinct_run(
 @pytest.mark.parametrize(
     ("case", "message"),
     [
-        ("schema", "schema_version 3"),
+        ("schema", "schema_version 4"),
         ("duplicate", "Duplicate fragment output_file"),
         ("traversal", "cannot contain '..' traversal"),
         ("source_split", "split does not match its original source split"),
@@ -507,7 +596,7 @@ def test_invalid_stage_one_inputs_abort_without_partial_publication(
     project = _make_synthetic_project(tmp_path, make_instrument, write_midi_file)
 
     if case == "schema":
-        project.manifest["schema_version"] = 2
+        project.manifest["schema_version"] = 3
     elif case == "duplicate":
         project.manifest["fragments"].append(
             deepcopy(project.manifest["fragments"][0])
@@ -647,8 +736,14 @@ def test_fragment_changed_during_encoding_is_detected(
     pipeline = importlib.import_module("midi_idea_generator.tokenization_pipeline")
     real_encode = pipeline.encode_midi
 
-    def mutating_encode(tokenizer, path, *, techniques):
-        result = real_encode(tokenizer, path, techniques=techniques)
+    def mutating_encode(tokenizer, path, *, techniques, tonic, mode):
+        result = real_encode(
+            tokenizer,
+            path,
+            techniques=techniques,
+            tonic=tonic,
+            mode=mode,
+        )
         Path(path).write_bytes(Path(path).read_bytes() + b"changed")
         return result
 

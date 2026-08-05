@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate unconditional symbolic guitar ideas from a Stage 3 checkpoint."""
+"""Generate symbolic guitar ideas from a Stage 3 checkpoint."""
 
 from __future__ import annotations
 
@@ -24,11 +24,11 @@ from midi_idea_generator.utils import JsonWriteError, configure_logging
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the unconditional-generation command-line parser."""
+    """Build the symbolic-generation command-line parser."""
 
     parser = argparse.ArgumentParser(
         description=(
-            "Sample unconditional guitar-token sequences and export MIDI, "
+            "Sample guitar-token sequences and export MIDI, "
             "metadata, technique annotations, and piano-roll images."
         )
     )
@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run unconditional generation and return a process exit code."""
+    """Run conditioned or legacy generation and return a process exit code."""
 
     args = build_parser().parse_args(argv)
     configure_logging(args.verbose)
@@ -61,10 +61,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR | {exc}", file=sys.stderr)
         return 2
 
+    mode = (
+        "tonality-conditioned"
+        if config.conditioning is not None
+        else "unconditional"
+    )
     print(
-        f"Generation complete: {len(report.samples)} unconditional sample(s) "
+        f"Generation complete: {len(report.samples)} {mode} sample(s) "
         f"on {report.device}."
     )
+    if config.conditioning is not None:
+        print(
+            "Conditioning: "
+            f"{config.conditioning.tonic} {config.conditioning.mode}."
+        )
     print(
         f"Checkpoint: {report.training_run_id}, epoch {report.epoch} "
         f"({report.checkpoint_sha256[:12]})."

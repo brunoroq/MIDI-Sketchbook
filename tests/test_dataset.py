@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from midi_idea_generator.tonality import MODE_NAMES, TONALITY_METHODS, TONIC_NAMES
 from midi_idea_generator.dataset import (
     DatasetContractError,
     TokenizedSequenceDataset,
@@ -21,8 +22,10 @@ from midi_idea_generator.tokenization_config import RemiTokenizerConfig
 from midi_idea_generator.tokenizer import (
     TECHNIQUE_TYPES,
     build_tokenizer,
+    get_mode_token_ids,
     get_special_token_ids,
     get_technique_token_ids,
+    get_tonic_token_ids,
     save_tokenizer,
 )
 
@@ -40,9 +43,12 @@ class _SyntheticCorpus:
     sequence_paths: dict[str, Path]
     special_ids: tuple[int, int, int]
     technique_ids: dict[str, int]
+    tonic_ids: dict[str, int]
+    mode_ids: dict[str, int]
     pitch_bend_ids: tuple[int, ...]
     duration_ids: tuple[int, ...]
     ordinary_ids: tuple[int, ...]
+    bar_id: int
 
     def write_manifest(self) -> None:
         _write_json(self.manifest_path, self.manifest)
@@ -134,6 +140,26 @@ def _summary(records: list[dict[str, Any]]) -> dict[str, Any]:
                 record["num_pitch_bend_tokens"] > 0 for record in records
             ),
         },
+        "tonality": {
+            "by_tonic": {
+                tonic: sum(
+                    record["tonality"]["tonic"] == tonic for record in records
+                )
+                for tonic in TONIC_NAMES
+            },
+            "by_mode": {
+                mode: sum(
+                    record["tonality"]["mode"] == mode for record in records
+                )
+                for mode in MODE_NAMES
+            },
+            "by_method": {
+                method: sum(
+                    record["tonality"]["method"] == method for record in records
+                )
+                for method in TONALITY_METHODS
+            },
+        },
     }
 
 
@@ -145,7 +171,7 @@ def _make_synthetic_corpus(
     split_lengths = split_lengths or {
         "train": (5, 7),
         "validation": (6,),
-        "test": (4,),
+        "test": (5,),
     }
     root = tmp_path / "synthetic-stage-three-project"
     root.mkdir()
@@ -162,7 +188,7 @@ def _make_synthetic_corpus(
         tokenizer_path,
         additional_attributes={
             "stage": 2,
-            "tokenization_schema_version": 2,
+            "tokenization_schema_version": 3,
             "tokenization_run_id": _TOKENIZATION_RUN_ID,
             "configuration_sha256": configuration_sha256,
         },
@@ -170,6 +196,8 @@ def _make_synthetic_corpus(
     tokenizer_sha256, tokenizer_size = _fingerprint(tokenizer_path)
     special = get_special_token_ids(tokenizer)
     technique_ids = get_technique_token_ids(tokenizer)
+    tonic_ids = get_tonic_token_ids(tokenizer)
+    mode_ids = get_mode_token_ids(tokenizer)
     pitch_bend_ids = tuple(
         int(token_id)
         for token, token_id in tokenizer.vocab.items()
@@ -185,31 +213,45 @@ def _make_synthetic_corpus(
         for token, token_id in tokenizer.vocab.items()
         if int(token_id) not in {special.pad, special.bos, special.eos}
         and int(token_id) not in set(technique_ids.values())
+        and int(token_id) not in set(tonic_ids.values())
+        and int(token_id) not in set(mode_ids.values())
         and not token.startswith("PitchBend_")
         and not token.startswith("Duration_")
     )
-    musical_ids = [
+    base_pool = [
         int(token_id)
         for token, token_id in tokenizer.vocab.items()
         if int(token_id) not in {special.pad, special.bos, special.eos}
         and int(token_id) not in set(technique_ids.values())
+        and int(token_id) not in set(tonic_ids.values())
+        and int(token_id) not in set(mode_ids.values())
         and not token.startswith("PitchBend_")
+        and not token.startswith("Bar_")
     ]
+    bar_id = int(tokenizer.vocab["Bar_None"])
+    tonality = {
+        "tonic": "E",
+        "mode": "PHRYGIAN",
+        "method": "MANUAL",
+        "tonic_confidence": None,
+        "mode_confidence": None,
+    }
 
     records: list[dict[str, Any]] = []
     sequence_paths: dict[str, Path] = {}
     serial = 0
     for split in ("train", "validation", "test"):
         for split_index, num_tokens in enumerate(split_lengths.get(split, ())):
-            assert num_tokens >= 3
+            assert num_tokens >= 5
             sequence_id = f"{split}-riff-{split_index:02d}-{serial:012x}"
             musical_length = num_tokens - 2
+            base_length = musical_length - 2
             ids = [
                 special.bos,
-                *(
-                    musical_ids[index % len(musical_ids)]
-                    for index in range(musical_length)
-                ),
+                tonic_ids[tonality["tonic"]],
+                mode_ids[tonality["mode"]],
+                bar_id,
+                *(base_pool[index % len(base_pool)] for index in range(base_length - 1)),
                 special.eos,
             ]
             sequence_path = run_dir / split / f"{sequence_id}.json"
@@ -217,12 +259,13 @@ def _make_synthetic_corpus(
             _write_json(
                 sequence_path,
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "sequence_id": sequence_id,
                     "ids": ids,
                     "programs": programs,
                     "technique_coverage": "UNLABELED",
                     "techniques": [],
+                    "tonality": deepcopy(tonality),
                 },
             )
             sequence_sha256, sequence_size = _fingerprint(sequence_path)
@@ -260,19 +303,20 @@ def _make_synthetic_corpus(
                 "techniques": [],
                 "track_number": 0,
                 "transpose_semitones": 0,
+                "tonality": deepcopy(tonality),
             }
             records.append(record)
             sequence_paths[sequence_id] = sequence_path
             serial += 1
 
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "tokenization_run_id": _TOKENIZATION_RUN_ID,
         "tokenized_run_dir": run_dir.relative_to(root).as_posix(),
         "preprocessing": {
             "manifest_path": "data/splits/manifest.json",
             "manifest_sha256": "1" * 64,
-            "schema_version": 3,
+            "schema_version": 4,
             "run_id": _PREPROCESSING_RUN_ID,
             "configuration_sha256": "2" * 64,
         },
@@ -283,7 +327,7 @@ def _make_synthetic_corpus(
             "fixture": "1",
         },
         "tokenizer": {
-            "type": "GuitarREMI",
+            "type": "ConditionedGuitarREMI",
             "path": tokenizer_path.relative_to(root).as_posix(),
             "sha256": tokenizer_sha256,
             "size_bytes": tokenizer_size,
@@ -295,6 +339,9 @@ def _make_synthetic_corpus(
                 "eos": special.eos,
             },
             "technique_token_ids": technique_ids,
+            "conditioning_schema_version": 1,
+            "tonic_token_ids": tonic_ids,
+            "mode_token_ids": mode_ids,
             "pitch_bend_sensitivity_semitones": 6,
         },
         "summary": _summary(records),
@@ -308,9 +355,12 @@ def _make_synthetic_corpus(
         sequence_paths=sequence_paths,
         special_ids=(special.pad, special.bos, special.eos),
         technique_ids=technique_ids,
+        tonic_ids=tonic_ids,
+        mode_ids=mode_ids,
         pitch_bend_ids=pitch_bend_ids,
         duration_ids=duration_ids,
         ordinary_ids=ordinary_ids,
+        bar_id=bar_id,
     )
     corpus.write_manifest()
     return corpus
@@ -388,9 +438,22 @@ def test_dataset_uses_manifest_only_and_builds_next_token_pairs(tmp_path: Path) 
     assert first["target_ids"] == tuple(payload["ids"][1:])
     assert corpus.special_ids[0] not in first["input_ids"]
     assert corpus.special_ids[0] not in first["target_ids"]
-    assert len(first["loss_mask"]) == first["length"]
+    assert len(first["unknown_technique_decision_mask"]) == first["length"]
+    assert isinstance(dataset.technique_token_ids, frozenset)
+    assert dataset.technique_token_ids == frozenset(corpus.technique_ids.values())
+    assert dataset.tonic_token_ids == frozenset(corpus.tonic_ids.values())
+    assert dataset.mode_token_ids == frozenset(corpus.mode_ids.values())
+    assert len(dataset.token_type_by_id) == dataset.vocabulary_size
+    assert dataset.token_type_by_id[dataset.pad_token_id] == "PAD"
+    assert {
+        dataset.token_type_by_id[token_id]
+        for token_id in dataset.technique_token_ids
+    } == {"Technique"}
     assert first["length"] == len(payload["ids"]) - 1
     assert first["split"] == "train"
+    assert first["tonality"] == payload["tonality"]
+    assert first["input_ids"][1] == corpus.tonic_ids["E"]
+    assert first["input_ids"][2] == corpus.mode_ids["PHRYGIAN"]
     assert first["input_ids"][0] == dataset.bos_token_id
     assert first["target_ids"][-1] == dataset.eos_token_id
     assert dataset.pad_token_id == corpus.special_ids[0]
@@ -446,22 +509,29 @@ def test_dynamic_collate_pads_inputs_targets_and_mask(tmp_path: Path) -> None:
 
     assert batch["input_ids"].shape == (2, 7)
     assert batch["target_ids"].shape == (2, 7)
-    assert batch["loss_mask"].shape == (2, 7)
+    assert batch["unknown_technique_decision_mask"].shape == (2, 7)
     assert batch["lengths"].tolist() == [4, 7]
     assert batch["attention_mask"].dtype == torch.bool
-    assert batch["loss_mask"].dtype == torch.bool
+    assert batch["unknown_technique_decision_mask"].dtype == torch.bool
     assert batch["attention_mask"].tolist() == [
         [True, True, True, True, False, False, False],
         [True, True, True, True, True, True, True],
     ]
     assert batch["input_ids"][0, 4:].tolist() == [dataset.pad_token_id] * 3
     assert batch["target_ids"][0, 4:].tolist() == [dataset.pad_token_id] * 3
-    assert batch["loss_mask"][0, 4:].tolist() == [False, False, False]
-    assert batch["loss_mask"][0, :4].tolist() == list(dataset[0]["loss_mask"])
-    assert batch["loss_mask"][1, :7].tolist() == list(dataset[1]["loss_mask"])
-    assert torch.all(batch["target_ids"][~batch["loss_mask"]] == dataset.pad_token_id)
+    assert batch["unknown_technique_decision_mask"][0, 4:].tolist() == [
+        False,
+        False,
+        False,
+    ]
+    assert batch["unknown_technique_decision_mask"][0, :4].tolist() == list(
+        dataset[0]["unknown_technique_decision_mask"]
+    )
+    assert batch["unknown_technique_decision_mask"][1, :7].tolist() == list(
+        dataset[1]["unknown_technique_decision_mask"]
+    )
     assert int((batch["target_ids"] != dataset.pad_token_id).sum().item()) == sum(
-        sum(sample["loss_mask"]) for sample in (dataset[0], dataset[1])
+        sample["length"] for sample in (dataset[0], dataset[1])
     )
     assert batch["sequence_ids"] == [
         dataset[0]["sequence_id"],
@@ -472,21 +542,26 @@ def test_dynamic_collate_pads_inputs_targets_and_mask(tmp_path: Path) -> None:
     collator = make_collate_fn(dataset.pad_token_id)
     repeated = collator([dataset[0], dataset[1]])
     assert torch.equal(repeated["input_ids"], batch["input_ids"])
-    assert torch.equal(repeated["loss_mask"], batch["loss_mask"])
+    assert torch.equal(
+        repeated["unknown_technique_decision_mask"],
+        batch["unknown_technique_decision_mask"],
+    )
 
 
-def test_unlabeled_masks_only_duration_decisions_but_complete_empty_does_not(
+def test_unlabeled_marks_duration_decisions_without_erasing_real_targets(
     tmp_path: Path,
 ) -> None:
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     corpus = _make_synthetic_corpus(
         tmp_path,
-        split_lengths={"train": (5, 5)},
+        split_lengths={"train": (7, 7)},
     )
     pad, bos, eos = corpus.special_ids
     ids = [
         bos,
-        corpus.ordinary_ids[0],
+        corpus.tonic_ids["E"],
+        corpus.mode_ids["PHRYGIAN"],
+        corpus.bar_id,
         corpus.duration_ids[0],
         corpus.ordinary_ids[1],
         eos,
@@ -507,29 +582,33 @@ def test_unlabeled_masks_only_duration_decisions_but_complete_empty_does_not(
     assert unlabeled["input_ids"] == tuple(ids[:-1])
     assert unlabeled["target_ids"] == tuple(ids[1:])
     assert pad not in unlabeled["target_ids"]
-    assert unlabeled["loss_mask"] == (True, True, False, True)
-    assert complete["loss_mask"] == (True, True, True, True)
+    assert unlabeled["unknown_technique_decision_mask"] == (
+        False,
+        False,
+        False,
+        False,
+        True,
+        False,
+    )
+    assert complete["unknown_technique_decision_mask"] == (False,) * 6
 
     batch = collate_token_sequences([unlabeled, complete], pad)
 
-    assert batch["attention_mask"].tolist() == [[True] * 4, [True] * 4]
-    assert batch["loss_mask"].tolist() == [
-        [True, True, False, True],
-        [True, True, True, True],
+    assert batch["attention_mask"].tolist() == [[True] * 6, [True] * 6]
+    assert batch["unknown_technique_decision_mask"].tolist() == [
+        [False, False, False, False, True, False],
+        [False, False, False, False, False, False],
     ]
-    assert batch["target_ids"][0].tolist() == [ids[1], ids[2], pad, eos]
+    assert batch["target_ids"][0].tolist() == list(ids[1:])
     assert batch["target_ids"][1].tolist() == list(ids[1:])
-    assert int((batch["target_ids"] != pad).sum().item()) == 7
-    assert torch.equal(
-        batch["target_ids"] != pad,
-        batch["loss_mask"],
-    )
+    assert batch["target_ids"][0, 4].item() == ids[5]
+    assert int((batch["target_ids"] != pad).sum().item()) == 12
 
 
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        ("schema", "schema_version 2"),
+        ("schema", "schema_version 3"),
         ("summary", "summary.sequences does not match"),
         ("sequence_traversal", "normalized relative path without traversal"),
         ("split_path", "declared split directory"),
@@ -544,7 +623,7 @@ def test_malformed_manifest_contract_is_rejected(
 ) -> None:
     corpus = _make_synthetic_corpus(tmp_path)
     if mutation == "schema":
-        corpus.manifest["schema_version"] = 1
+        corpus.manifest["schema_version"] = 2
     elif mutation == "summary":
         corpus.manifest["summary"]["sequences"] += 1
     elif mutation == "sequence_traversal":
@@ -627,7 +706,7 @@ def test_collate_rejects_pre_padded_or_inconsistent_samples() -> None:
     sample = {
         "input_ids": (1, 3),
         "target_ids": (3, 2),
-        "loss_mask": (True, True),
+        "unknown_technique_decision_mask": (False, False),
         "length": 2,
         "sequence_id": "valid-sequence",
         "split": "train",
@@ -643,19 +722,28 @@ def test_collate_rejects_pre_padded_or_inconsistent_samples() -> None:
             [{**sample, "length": 3}],
             pad_token_id=0,
         )
-    with pytest.raises(DatasetContractError, match="missing field.*loss_mask"):
+    with pytest.raises(
+        DatasetContractError,
+        match="missing field.*unknown_technique_decision_mask",
+    ):
         collate_token_sequences(
-            [{key: value for key, value in sample.items() if key != "loss_mask"}],
+            [
+                {
+                    key: value
+                    for key, value in sample.items()
+                    if key != "unknown_technique_decision_mask"
+                }
+            ],
             pad_token_id=0,
         )
     with pytest.raises(DatasetContractError, match="must be boolean"):
         collate_token_sequences(
-            [{**sample, "loss_mask": (True, 1)}],
+            [{**sample, "unknown_technique_decision_mask": (False, 1)}],
             pad_token_id=0,
         )
     with pytest.raises(DatasetContractError, match="lengths must match"):
         collate_token_sequences(
-            [{**sample, "loss_mask": (True,)}],
+            [{**sample, "unknown_technique_decision_mask": (False,)}],
             pad_token_id=0,
         )
     with pytest.raises(DatasetContractError, match="empty batch"):
@@ -716,12 +804,16 @@ def test_complete_coverage_can_confirm_an_empty_technique_list(
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        ("type", "tokenizer.type 'GuitarREMI'"),
+        ("type", "tokenizer.type 'ConditionedGuitarREMI'"),
         ("missing_ids", "missing field"),
         ("unknown_id", "unknown field"),
         ("duplicate_ids", "IDs must be distinct"),
         ("wrong_id", "do not match the manifest"),
         ("sensitivity", "must be 6"),
+        ("conditioning_schema", "conditioning_schema_version must be 1"),
+        ("missing_tonic", "missing field"),
+        ("wrong_mode", "do not match the manifest"),
+        ("cross_duplicate", "mutually distinct"),
     ],
 )
 def test_guitar_tokenizer_manifest_contract_is_strict(
@@ -747,9 +839,57 @@ def test_guitar_tokenizer_manifest_contract_is_strict(
         ) + 100
     elif mutation == "sensitivity":
         tokenizer["pitch_bend_sensitivity_semitones"] = 5
+    elif mutation == "conditioning_schema":
+        tokenizer["conditioning_schema_version"] = 2
+    elif mutation == "missing_tonic":
+        tokenizer["tonic_token_ids"].pop("E")
+    elif mutation == "wrong_mode":
+        tokenizer["mode_token_ids"]["BLUES"] += 1000
+    elif mutation == "cross_duplicate":
+        tokenizer["mode_token_ids"]["BLUES"] = tokenizer["tonic_token_ids"]["E"]
     else:  # pragma: no cover
         raise AssertionError(mutation)
     corpus.write_manifest()
+
+    with pytest.raises(DatasetContractError, match=message):
+        TokenizedSequenceDataset(corpus.manifest_path, "train")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("wrong_tonic", "fixed prefix positions"),
+        ("duplicate_tonic", "fixed prefix positions"),
+        ("swapped", "fixed prefix positions"),
+        ("metadata", "fixed prefix positions"),
+        ("nonbar", "immediately after Mode"),
+    ],
+)
+def test_condition_prefix_exactly_matches_tonality_metadata(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    corpus = _make_synthetic_corpus(tmp_path)
+    record, payload, sequence_path = _first_sequence(corpus)
+    if mutation == "wrong_tonic":
+        payload["ids"][1] = corpus.tonic_ids["G"]
+    elif mutation == "duplicate_tonic":
+        payload["ids"].insert(-1, corpus.tonic_ids["G"])
+    elif mutation == "swapped":
+        payload["ids"][1], payload["ids"][2] = (
+            payload["ids"][2],
+            payload["ids"][1],
+        )
+    elif mutation == "metadata":
+        changed = {**record["tonality"], "tonic": "G"}
+        record["tonality"] = deepcopy(changed)
+        payload["tonality"] = deepcopy(changed)
+    elif mutation == "nonbar":
+        payload["ids"][3] = corpus.duration_ids[0]
+    else:  # pragma: no cover
+        raise AssertionError(mutation)
+    _publish_sequence_change(corpus, record, payload, sequence_path)
 
     with pytest.raises(DatasetContractError, match=message):
         TokenizedSequenceDataset(corpus.manifest_path, "train")
@@ -759,9 +899,9 @@ def test_preprocessing_and_tokenizer_artifact_schema_versions_are_exact(
     tmp_path: Path,
 ) -> None:
     corpus = _make_synthetic_corpus(tmp_path)
-    corpus.manifest["preprocessing"]["schema_version"] = 2
+    corpus.manifest["preprocessing"]["schema_version"] = 3
     corpus.write_manifest()
-    with pytest.raises(DatasetContractError, match="must be 3"):
+    with pytest.raises(DatasetContractError, match="must be 4"):
         TokenizedSequenceDataset(corpus.manifest_path, "train")
 
     embedded_root = tmp_path / "embedded"
@@ -775,7 +915,7 @@ def test_preprocessing_and_tokenizer_artifact_schema_versions_are_exact(
     corpus.manifest["tokenizer"]["sha256"] = tokenizer_sha256
     corpus.manifest["tokenizer"]["size_bytes"] = tokenizer_size
     corpus.write_manifest()
-    with pytest.raises(DatasetContractError, match="Stage 2 schema 2"):
+    with pytest.raises(DatasetContractError, match="Stage 2 schema 3"):
         TokenizedSequenceDataset(corpus.manifest_path, "train")
 
 
@@ -907,10 +1047,12 @@ def test_pitch_bend_count_is_derived_from_vocabulary_tokens(
         ("coverage", "techniques.coverage"),
         ("pitch_total", "pitch_bends"),
         ("pitch_sequences", "pitch_bends"),
+        ("tonic", "tonality.by_tonic.E"),
+        ("method", "tonality.by_method.MANUAL"),
         ("unknown", "unknown field"),
     ],
 )
-def test_schema_two_summary_is_recomputed_strictly(
+def test_schema_three_summary_is_recomputed_strictly(
     tmp_path: Path,
     mutation: str,
     message: str,
@@ -928,6 +1070,10 @@ def test_schema_two_summary_is_recomputed_strictly(
         summary["pitch_bends"]["total_tokens"] += 1
     elif mutation == "pitch_sequences":
         summary["pitch_bends"]["sequences_with_pitch_bends"] += 1
+    elif mutation == "tonic":
+        summary["tonality"]["by_tonic"]["E"] += 1
+    elif mutation == "method":
+        summary["tonality"]["by_method"]["MANUAL"] += 1
     elif mutation == "unknown":
         summary["techniques"]["unexpected"] = 0
     else:  # pragma: no cover
@@ -941,12 +1087,12 @@ def test_schema_two_summary_is_recomputed_strictly(
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        ("payload_schema", "schema_version 2"),
+        ("payload_schema", "schema_version 3"),
         ("payload_missing", "missing field"),
         ("record_missing", "missing field"),
     ],
 )
-def test_sequence_schema_two_requires_all_new_fields(
+def test_sequence_schema_three_requires_all_new_fields(
     tmp_path: Path,
     mutation: str,
     message: str,
@@ -954,7 +1100,7 @@ def test_sequence_schema_two_requires_all_new_fields(
     corpus = _make_synthetic_corpus(tmp_path)
     record, payload, sequence_path = _first_sequence(corpus)
     if mutation == "payload_schema":
-        payload["schema_version"] = 1
+        payload["schema_version"] = 2
     elif mutation == "payload_missing":
         payload.pop("technique_coverage")
     elif mutation == "record_missing":

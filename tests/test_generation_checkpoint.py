@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import math
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -56,6 +57,41 @@ def _history_entry() -> dict[str, Any]:
         "validation_tokens": 20,
         "mean_gradient_norm": 0.75,
         "duration_seconds": 0.1,
+    }
+
+
+def _metric_aggregate(count: int, nll: float | None) -> dict[str, Any]:
+    if count == 0:
+        return {
+            "count": 0,
+            "full_vocab_nll": None,
+            "full_vocab_perplexity": None,
+            "objective_nll": None,
+            "objective_perplexity": None,
+            "token_top1_accuracy": None,
+            "token_top5_accuracy": None,
+            "type_top1_accuracy": None,
+        }
+    assert nll is not None
+    return {
+        "count": count,
+        "full_vocab_nll": nll + 0.1,
+        "full_vocab_perplexity": math.exp(nll + 0.1),
+        "objective_nll": nll,
+        "objective_perplexity": math.exp(nll),
+        "token_top1_accuracy": 0.25,
+        "token_top5_accuracy": 0.75,
+        "type_top1_accuracy": 0.8,
+    }
+
+
+def _metrics_report(count: int, nll: float) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "batches": 2,
+        "total": _metric_aggregate(count, nll),
+        "post_duration_unknown": _metric_aggregate(0, None),
+        "by_target_type": {"Pitch": _metric_aggregate(count, nll)},
     }
 
 
@@ -199,6 +235,22 @@ def test_load_generation_bundle_restores_eval_model_and_provenance(
         torch.testing.assert_close(parameter, original.state_dict()[name], rtol=0, atol=0)
 
 
+def test_load_generation_bundle_accepts_current_schema_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint, manifest, _tokenizer, _model_value, payload = _artifacts(
+        tmp_path, monkeypatch
+    )
+    payload["schema_version"] = 2
+    payload["history"][0]["train_metrics"] = _metrics_report(80, 2.5)
+    payload["history"][0]["validation_metrics"] = _metrics_report(20, 2.25)
+    torch.save(payload, checkpoint)
+
+    bundle = load_generation_bundle(checkpoint, manifest, tmp_path, "cpu")
+
+    assert bundle.training_run_id == RUN_ID
+
+
 def test_checkpoint_is_deserialized_in_restricted_cpu_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -312,7 +364,7 @@ def test_inconsistent_checkpoint_metadata_is_rejected(
         tmp_path, monkeypatch
     )
     if mutation == "schema":
-        payload["schema_version"] = 2
+        payload["schema_version"] = 3
     elif mutation == "unknown":
         payload["unexpected"] = True
     elif mutation == "progress":

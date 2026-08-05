@@ -70,6 +70,13 @@ class AugmentationConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class TonalityConfig:
+    """Policy for resolving tonic and mode when no manual sidecar exists."""
+
+    missing_sidecar_policy: str = "infer_source"
+
+
+@dataclass(frozen=True, slots=True)
 class SplitConfig:
     """Source-file-level dataset split ratios."""
 
@@ -89,6 +96,7 @@ class PreprocessConfig:
     track_selection: TrackSelectionConfig
     preprocessing: ProcessingConfig
     augmentation: AugmentationConfig
+    tonality: TonalityConfig
     splits: SplitConfig
 
 
@@ -384,6 +392,23 @@ def _load_augmentation(root: Mapping[str, Any]) -> AugmentationConfig:
     return config
 
 
+def _load_tonality(root: Mapping[str, Any]) -> TonalityConfig:
+    raw_values = root.get("tonality", {})
+    values = _mapping(raw_values, "tonality")
+    _reject_unknown(values, {"missing_sidecar_policy"}, "tonality")
+    policy = values.get("missing_sidecar_policy", "infer_source")
+    if not isinstance(policy, str) or policy not in {
+        "infer_source",
+        "infer_fragment",
+        "unknown",
+    }:
+        raise ConfigError(
+            "'tonality.missing_sidecar_policy' must be 'infer_source', "
+            "'infer_fragment', or 'unknown'."
+        )
+    return TonalityConfig(missing_sidecar_policy=policy)
+
+
 def _load_splits(root: Mapping[str, Any]) -> SplitConfig:
     values = _section(root, "splits")
     _reject_unknown(values, {"train", "validation", "test"}, "splits")
@@ -426,6 +451,7 @@ def load_preprocess_config(path: str | Path) -> PreprocessConfig:
         "track_selection",
         "preprocessing",
         "augmentation",
+        "tonality",
         "splits",
     }
     _reject_unknown(root, allowed, "root")
@@ -443,5 +469,6 @@ def load_preprocess_config(path: str | Path) -> PreprocessConfig:
         track_selection=_load_track_selection(root),
         preprocessing=_load_processing(root),
         augmentation=_load_augmentation(root),
+        tonality=_load_tonality(root),
         splits=_load_splits(root),
     )

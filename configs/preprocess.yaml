@@ -43,6 +43,12 @@ augmentation:
   # Keep validation and test distributions untouched by default.
   apply_to_splits: [train]
 
+# A sibling `<name>.mid.tonality.json` sidecar always takes precedence.
+# Missing labels are inferred once from the original source by default, before
+# pitch-transposition augmentation. Alternatives: infer_fragment or unknown.
+tonality:
+  missing_sidecar_policy: infer_source
+
 splits:
   train: 0.8
   validation: 0.1
